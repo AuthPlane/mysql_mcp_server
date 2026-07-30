@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-07-30
+
+### Fixed
+- **C Extension Fallback:** Stopped forcing `use_pure=False` in the connection config by default. `mysql-connector-python` treats an explicit `use_pure=False` as a hard requirement for its C extension, raising `ImportError` instead of falling back to the pure-Python implementation when the extension can't load (e.g. built against a newer OpenSSL than the host provides, as with `mysql-connector-python` 26.7.0 on many Linux systems). `use_pure` is now only set when `MYSQL_USE_PURE` is explicitly configured.
+
 ## [0.4.3] - 2026-07-30
 
 ### Fixed
