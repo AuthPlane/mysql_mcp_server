@@ -140,12 +140,19 @@ def get_db_config(host=None, port=None):
         "connect_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
         # Compatibility parameters for older MySQL versions (Issue #31)
         "auth_plugin": os.getenv("MYSQL_AUTH_PLUGIN"),
-        "use_pure": os.getenv("MYSQL_USE_PURE", "false").lower() == "true",
         "raise_on_warnings": os.getenv("MYSQL_RAISE_ON_WARNINGS", "false").lower() == "true",
     }
-    
+
     # Remove None values
     config = {k: v for k, v in config.items() if v is not None}
+
+    # Only set use_pure when explicitly requested. Passing use_pure=False
+    # explicitly makes the connector raise ImportError if the C extension
+    # is unavailable (e.g. built against a newer OpenSSL than the host has);
+    # omitting the key lets it fall back to the pure-Python implementation.
+    use_pure_env = os.getenv("MYSQL_USE_PURE")
+    if use_pure_env is not None:
+        config["use_pure"] = use_pure_env.lower() == "true"
     
     # Allow overriding collation/charset to be empty if needed for older versions.
     if config["charset"] == "": del config["charset"]
