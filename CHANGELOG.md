@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-07-30
+
+### Fixed
+- **Missing Runtime Dependency:** `python-dotenv` is now declared as a required dependency. The server imports it directly, but `uvx`'s isolated environment doesn't install it automatically, causing a `ModuleNotFoundError` on startup (#95).
+- **MCP 2.x Incompatibility:** Constrained the `mcp` dependency to `<2` since MCP 2.0 introduced breaking API changes this server has not been migrated to support, and the previous unbounded `>=1.2.0` allowed `uvx` to resolve an incompatible version (#95).
+
 ## [0.4.1] - 2026-06-08
 
 ### Fixed
