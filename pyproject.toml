@@ -28,6 +28,14 @@ sse = [
     "starlette>=0.35.0",
     "uvicorn>=0.27.0",
 ]
+# Opt-in OAuth 2.1 resource-server authentication for the SSE transport.
+# Not installed unless requested: pip install mysql_mcp_server[auth]
+# Requires Python >= 3.12 (the SDK's own floor), so it stays out of the base
+# install, which supports 3.11.
+auth = [
+    "mysql_mcp_server[sse]",
+    "authplane-sdk==0.2.0",
+]
 
 [[project.authors]]
 name = "Dana K. Williams"

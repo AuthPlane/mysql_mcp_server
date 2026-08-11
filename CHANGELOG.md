@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Opt-in OAuth 2.1 authentication for the SSE transport.** Off unless `MCP_AUTH_MODE` is set; with it unset no middleware is installed, no routes are added, and the auth dependency is never imported. Auth dependencies live in a new `[auth]` optional-dependency group (`pip install mysql_mcp_server[auth]`), so the base install is unchanged.
+  - Both MCP endpoints are protected. `GET /sse` issues the session id and `POST /messages/` is where tool calls arrive, so authenticating only `/sse` would leave every tool call reachable without credentials.
+  - `/` and `/.well-known/oauth-protected-resource` (RFC 9728) stay public: orchestrators probe the first before credentials exist, and a client cannot obtain a token without reading the second.
+  - Tokens are accepted only from the `Authorization` header. A query-string token would leak into proxy logs and `Referer` headers.
+  - Provider-neutral by construction: the middleware depends on a `TokenVerifier` protocol and never imports a specific provider. Authplane is the implementation shipped.
+- **`read_query` and `write_query` tools**, splitting the read and write paths so each can require a different scope. `execute_sql` is now deprecated: it accepts arbitrary SQL, so it cannot be authorized precisely and is treated as a write.
+- **Read/write separation enforced by MySQL.** With `MYSQL_RO_USER` / `MYSQL_RO_PASSWORD` set, read tools connect as a `SELECT`-only account, so a write that gets past statement classification is refused by the database. Grants are verified at startup and the server refuses to start if that account can write. Without it, reads run inside `START TRANSACTION READ ONLY` and a startup warning is logged.
+- **Per-tool scope enforcement** via `MYSQL_SCOPE_READ` / `MYSQL_SCOPE_WRITE`. An unmapped tool name falls back to the write scope so a tool added later fails closed.
+- **Session binding** (`MCP_AUTH_BIND_SESSION`, default on). An SSE session belongs to the subject that opened it; a valid token belonging to a different subject is refused on it.
+- **Structured audit records** (`MCP_AUTH_AUDIT`, default on) on the `mysql_mcp_server.audit` logger — one JSON object per line with subject, client id, `jti`, tool and statement. Tokens are never recorded and statements are truncated.
+- **DPoP support** (`MCP_AUTH_DPOP`: `off` / `optional` / `required`, RFC 9449) for sender-constrained tokens, so a stolen token without the client's key is unusable.
+- **Optional revocation checking** (`MCP_AUTH_REVOCATION_CHECK`, RFC 7662), configured fail-closed. Off by default because local validation is what keeps the server working when the authorization server is unreachable.
+- **Optional authentication-failure throttling** (`MCP_AUTH_MAX_AUTH_FAILURES`). Off by default: the only key available is the socket peer address, which behind a reverse proxy puts every caller in one bucket.
+- **Result guardrails:** `MYSQL_MAX_ROWS` caps rows per result set and reports truncation explicitly; `MYSQL_STATEMENT_TIMEOUT_MS` bounds read statements server-side.
+
+### Changed
+- Result sets are read with `fetchmany()` rather than `fetchall()` so `MYSQL_MAX_ROWS` can cap them without materialising the whole set.
+- Statements refused on policy grounds are now reported as tool *errors* (`isError: true`) rather than as ordinary content, so a client can tell a refusal from an answer. Unexpected failures still return readable content, as before.
+- MySQL "access denied" errors on the read path are reported with a fixed message instead of the server's own text, which names the database account and host.
+
+### Security
+- **`read_query` refuses constructs a `SELECT`-only grant would otherwise allow:** `INTO OUTFILE` and `INTO DUMPFILE` (write a file on the database server), `LOAD_FILE()` (reads one), `FOR UPDATE` and `LOCK IN SHARE MODE` (take locks), `SLEEP()` and `BENCHMARK()` (consume resources).
+- Statement classification strips comments and string literals before inspecting the statement, so a write hidden behind `/* */`, `--` or `#`, or inside a CTE, is still refused. MySQL's version-gated `/*! ... */` comments are treated as executable code, because that is what MySQL does with them.
+- Existing DNS-rebinding protection is untouched and applies independently of authentication.
+
 ## [0.4.4] - 2026-07-30
 
 ### Fixed

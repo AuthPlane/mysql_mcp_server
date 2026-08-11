@@ -46,12 +46,16 @@ async def test_call_tool_empty_results(mock_get_config, mock_connect):
     mock_cursor = MagicMock()
     mock_cursor.description = [("id",)]
     mock_cursor.fetchall.return_value = []
-    
+    # Result sets are now read with fetchmany() so MYSQL_MAX_ROWS can cap them
+    # without materialising the whole set; fetchall() is only used when the cap
+    # is disabled.
+    mock_cursor.fetchmany.return_value = []
+
     mock_conn = MagicMock()
     mock_conn.__enter__.return_value = mock_conn
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
-    
+
     response = await call_tool("execute_sql", {"query": "SELECT * FROM empty_table"})
     
     assert len(response) == 1
