@@ -8,6 +8,7 @@ crash.
 """
 
 import asyncio
+import importlib.util
 import socket
 import threading
 import time
@@ -19,6 +20,15 @@ from starlette.routing import Route
 
 from mysql_mcp_server.auth import AuthSettings, build_verifier
 from mysql_mcp_server.auth.protocol import VerifierConfigError
+
+# The Authplane SDK requires Python 3.12+ and ships in the optional [auth] extra,
+# so it is absent both on the 3.11 CI leg and on any base install. Tests that
+# exercise the real verifier skip rather than error, which keeps the suite green
+# for contributors who never touch auth.
+_HAS_SDK = importlib.util.find_spec("authplane") is not None
+requires_sdk = pytest.mark.skipif(
+    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk, Python 3.12+)"
+)
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +164,7 @@ def _settings(issuer: str) -> AuthSettings:
     )
 
 
+@requires_sdk
 @pytest.mark.asyncio
 async def test_unreachable_authorization_server_fails_with_an_actionable_message():
     """Not a traceback, and not a hang: a sentence naming the address and the fix.
@@ -172,6 +183,7 @@ async def test_unreachable_authorization_server_fails_with_an_actionable_message
     )
 
 
+@requires_sdk
 @pytest.mark.asyncio
 async def test_malformed_discovery_document_fails_cleanly():
     """A server that answers with nonsense must not be treated as usable."""
@@ -202,6 +214,7 @@ async def test_malformed_discovery_document_fails_cleanly():
         thread.join(timeout=10)
 
 
+@requires_sdk
 @pytest.mark.asyncio
 async def test_jwks_endpoint_serving_garbage_fails_cleanly():
     """Valid discovery, unusable key set: still a startup failure, not a half-alive server.
@@ -258,6 +271,7 @@ async def test_jwks_endpoint_serving_garbage_fails_cleanly():
         thread.join(timeout=10)
 
 
+@requires_sdk
 @pytest.mark.asyncio
 async def test_a_hanging_authorization_server_does_not_hang_startup_forever():
     """A socket that accepts and never answers must not wedge the boot.
@@ -426,6 +440,7 @@ def test_auth_package_imports_without_the_optional_dependency():
     )
 
 
+@requires_sdk
 @pytest.mark.asyncio
 async def test_missing_extra_produces_an_actionable_message(monkeypatch):
     """The message must name the install command, not just fail on ImportError."""

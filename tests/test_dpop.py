@@ -20,6 +20,8 @@ cryptographically valid is the SDK's job, exercised live rather than re-tested
 here.
 """
 
+import importlib.util
+
 import httpx
 import pytest
 from starlette.applications import Starlette
@@ -36,6 +38,15 @@ from mysql_mcp_server.auth.protocol import (
 )
 
 RESOURCE = "http://testserver"
+
+# The Authplane SDK requires Python 3.12+ and ships in the optional [auth] extra,
+# so it is absent both on the 3.11 CI leg and on any base install. Tests that
+# exercise the real verifier skip rather than error, which keeps the suite green
+# for contributors who never touch auth.
+_HAS_SDK = importlib.util.find_spec("authplane") is not None
+requires_sdk = pytest.mark.skipif(
+    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk, Python 3.12+)"
+)
 
 
 class ContextCapturingVerifier:
@@ -312,6 +323,7 @@ def test_required_mode_warns_at_startup(base_env, caplog):
     assert any("DPoP" in r.message for r in caplog.records)
 
 
+@requires_sdk
 def test_request_context_satisfies_the_sdk_protocol():
     """`RequestContext` is handed straight to the SDK, so its shape is a contract.
 
