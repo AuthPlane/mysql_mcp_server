@@ -81,9 +81,10 @@ MYSQL_RO_PASSWORD=       # account, so MySQL refuses writes regardless of this s
 MYSQL_MAX_ROWS=1000      # Cap on rows returned per result set (0 disables)
 MYSQL_STATEMENT_TIMEOUT_MS=30000  # Server-side limit on read statements (0 disables)
 
-# OAuth 2.1 Authentication (Optional, SSE only) — requires: pip install mysql_mcp_server[auth]
+# OAuth 2.1 Authentication via Authplane (Optional, SSE only)
+# Requires: pip install mysql_mcp_server[auth]   —   full reference: AUTHENTICATION.md
 MCP_AUTH_MODE=none                # 'authplane' to enable; 'none' (default) changes nothing
-AUTHPLANE_ISSUER=                 # Authorization server base URL, e.g. http://localhost:9000
+AUTHPLANE_ISSUER=                 # Authplane base URL, e.g. http://localhost:9000
 AUTHPLANE_RESOURCE=               # This server's canonical URI; must equal the token's 'aud'
 MYSQL_SCOPE_READ=mysql:read       # Scope required by the read tools
 MYSQL_SCOPE_WRITE=mysql:write     # Scope required by write_query and execute_sql
@@ -295,53 +296,26 @@ See [SECURITY.md](SECURITY.md) for a comprehensive guide on securing your deploy
 
 ## OAuth 2.1 authentication (SSE)
 
-Opt-in, and off unless you switch it on. With `MCP_AUTH_MODE` unset the server behaves exactly as it did before this feature existed: no middleware, no extra routes, and the auth dependency is never imported.
+The SSE transport can require an OAuth 2.1 access token, using [Authplane](https://authplane.com) as the authorization server via the official [Authplane Python SDK](https://pypi.org/project/authplane-sdk/) (`authplane-sdk`).
+
+It is optional and off by default. With `MCP_AUTH_MODE` unset the server behaves exactly as it did before this feature existed: no middleware, no extra routes, and the SDK is never imported.
 
 ```bash
 pip install mysql_mcp_server[auth]
 
 export MCP_TRANSPORT=sse
 export MCP_AUTH_MODE=authplane
-export AUTHPLANE_ISSUER=https://auth.example.com     # your authorization server
+export AUTHPLANE_ISSUER=https://auth.example.com     # your Authplane server
 export AUTHPLANE_RESOURCE=https://mcp.example.com    # this server's canonical URI
 export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...    # see Read/write separation
 python -m mysql_mcp_server
 ```
 
-**Both MCP endpoints are protected.** The SSE transport splits one logical call across `GET /sse` (which issues the session id) and `POST /messages/` (where every tool call arrives). Protecting only `/sse` would protect nothing, since a caller holding a session id can POST directly.
+Both MCP endpoints are protected: `GET /sse`, which issues the session id, and `POST /messages/`, which carries every tool call. The health probe `/` and the RFC 9728 metadata document at `/.well-known/oauth-protected-resource` stay public, since a client cannot obtain a token without first discovering where tokens come from.
 
-**Two paths stay public, by necessity:**
-- `/` — container orchestrators probe it before any credential exists.
-- `/.well-known/oauth-protected-resource` — the RFC 9728 metadata document. A client cannot obtain a token without first discovering where tokens come from; this is what lets MCP Inspector and Claude Desktop connect with no hand-configured endpoints.
+Tokens are accepted only in the `Authorization` header. Per-tool scopes are enforced: the read tools require `MYSQL_SCOPE_READ`, `write_query` and the deprecated `execute_sql` require `MYSQL_SCOPE_WRITE`. DPoP (RFC 9449) and per-request revocation checks are supported and ship disabled.
 
-**Per-tool scopes.** `read_query`, `get_schema_info` and `get_table_sample` require `MYSQL_SCOPE_READ`; `write_query` and the deprecated `execute_sql` require `MYSQL_SCOPE_WRITE`. A tool name that is not in the map falls back to the write scope, so a tool added later fails closed rather than shipping unprotected. A refusal comes back as a normal MCP tool error naming the scope required.
-
-**Provider-neutral by construction.** The middleware depends on a `TokenVerifier` protocol (`src/mysql_mcp_server/auth/protocol.py`) and never imports a specific provider. Authplane is the implementation shipped; supporting a different OAuth 2.1 server means writing a class that satisfies that protocol and registering it in `build_verifier()`.
-
-**Tokens are read only from the `Authorization` header.** A token in a query string would be copied into proxy access logs and `Referer` headers, so it is rejected; the metadata document advertises `bearer_methods_supported: ["header"]` accordingly.
-
-**Existing DNS-rebinding protection is unaffected.** `MCP_SSE_ALLOWED_HOSTS` and authentication are independent controls and both apply: a valid token with a disallowed `Host` header is still rejected.
-
-### Sender-constrained tokens (DPoP)
-
-`MCP_AUTH_DPOP=optional` advertises DPoP (RFC 9449) and verifies a proof when one is presented, so clients that support it are protected while clients that do not keep working. `required` refuses any request without a proof — which locks out every client that cannot produce one, so confirm your clients first.
-
-Without DPoP, an access token is a bearer token: whoever holds the string can use it from anywhere. With it, the token is bound to a key the client holds, and a stolen token on its own is useless.
-
-### Revocation
-
-Access tokens are validated locally, which is what keeps this server working when the authorization server is briefly unreachable. The trade-off is that a token revoked upstream stays valid here until it expires. `MCP_AUTH_REVOCATION_CHECK=true` (plus `AUTHPLANE_CLIENT_ID` / `AUTHPLANE_CLIENT_SECRET`, since introspection is an authenticated call) checks revocation on every request instead, and fails closed if the check cannot be answered.
-
-### Auditing
-
-With `MCP_AUTH_AUDIT=true` (the default) every authorized tool call and every denial is written to the `mysql_mcp_server.audit` logger as one JSON object per line, carrying the subject, client id, token id (`jti`), tool name and statement. Route it wherever you keep audit data:
-
-```python
-import logging
-logging.getLogger("mysql_mcp_server.audit").addHandler(my_handler)
-```
-
-Tokens are never recorded — only the `jti`, which is what lets a specific credential be traced without the log itself becoming a credential store. Statements are truncated so the trail does not become an archive of your data.
+📖 **See [AUTHENTICATION.md](AUTHENTICATION.md)** for how it works, which SDK calls are used and where, the full configuration reference, and the known limits.
 
 ## Read/write separation
 

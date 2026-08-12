@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Optional revocation checking** (`MCP_AUTH_REVOCATION_CHECK`, RFC 7662), configured fail-closed. Off by default because local validation is what keeps the server working when the authorization server is unreachable.
 - **Optional authentication-failure throttling** (`MCP_AUTH_MAX_AUTH_FAILURES`). Off by default: the only key available is the socket peer address, which behind a reverse proxy puts every caller in one bucket.
 - **Result guardrails:** `MYSQL_MAX_ROWS` caps rows per result set and reports truncation explicitly; `MYSQL_STATEMENT_TIMEOUT_MS` bounds read statements server-side.
+- **`AUTHENTICATION.md`** documenting the Authplane setup: the Authplane Python SDK (`authplane-sdk`) calls used and where, the full configuration reference, how a DPoP token is presented, and the known limits. The README section is now a short pointer to it.
+- **Tests against a live Authplane server** (`tests/test_authplane_live.py`, `tests/test_authplane_e2e.py`, `tests/authplane_harness.py`): real tokens through the real verifier, and a real MCP client driving the real server over HTTP. They skip unless `AUTHPLANE_TEST_ISSUER`, `AUTHPLANE_TEST_ADMIN_URL` and `AUTHPLANE_TEST_ADMIN_KEY` are set — see `tests/README.md`.
+
+### Fixed
+- **DPoP was unusable over HTTP.** The `Authorization` header parser accepted only the `Bearer` scheme, but RFC 9449 §7.1 requires a DPoP-bound token to be presented as `Authorization: DPoP <token>`. Every conforming DPoP client was refused with a 401 before its proof was examined. The proof handling itself was correct; only the scheme check was wrong. It went unnoticed because the DPoP tests drive a fake verifier and construct the request context directly, so none of them ever built this header.
+- **A proof presented under the `Bearer` scheme is now refused** rather than accepted, so a sender-constrained token cannot be passed off as an ordinary one.
+- **`WWW-Authenticate` now advertises the schemes actually accepted**, one header value per scheme: `Bearer` when DPoP is off, both when `optional`, and `DPoP` alone when `required`. Previously every challenge said `Bearer`, which in `required` mode named the one scheme that could not work. The DPoP challenge carries `algs` (RFC 9449 §5.1) so a client knows what to sign with.
 
 ### Changed
 - Result sets are read with `fetchmany()` rather than `fetchall()` so `MYSQL_MAX_ROWS` can cap them without materialising the whole set.
