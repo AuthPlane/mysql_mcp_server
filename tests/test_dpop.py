@@ -121,7 +121,7 @@ async def test_proof_header_is_passed_to_the_verifier():
     async with client_for(app) as client:
         await client.get(
             "/sse",
-            headers={"Authorization": "Bearer ok:alice", "DPoP": "the-proof-jwt"},
+            headers={"Authorization": "DPoP ok:alice", "DPoP": "the-proof-jwt"},
         )
 
     assert verifier.contexts[0].proof == "the-proof-jwt"
@@ -146,10 +146,10 @@ async def test_method_is_reported_per_request():
     app = build(verifier)
 
     async with client_for(app) as client:
-        await client.get("/sse", headers={"Authorization": "Bearer ok:alice", "DPoP": "p"})
+        await client.get("/sse", headers={"Authorization": "DPoP ok:alice", "DPoP": "p"})
         await client.post(
             "/messages/?session_id=s1", json=CALL,
-            headers={"Authorization": "Bearer ok:alice", "DPoP": "p"},
+            headers={"Authorization": "DPoP ok:alice", "DPoP": "p"},
         )
 
     assert [c.method for c in verifier.contexts] == ["GET", "POST"]
@@ -169,7 +169,7 @@ async def test_url_excludes_the_query_string():
     async with client_for(app) as client:
         await client.post(
             "/messages/?session_id=abc123", json=CALL,
-            headers={"Authorization": "Bearer ok:alice", "DPoP": "p"},
+            headers={"Authorization": "DPoP ok:alice", "DPoP": "p"},
         )
 
     url = verifier.contexts[0].url
@@ -193,7 +193,7 @@ async def test_url_comes_from_configuration_not_the_host_header():
         await client.get(
             "/sse",
             headers={
-                "Authorization": "Bearer ok:alice",
+                "Authorization": "DPoP ok:alice",
                 "DPoP": "p",
                 "Host": "attacker.example.net",
             },
@@ -239,7 +239,7 @@ async def test_malformed_proof_header_bytes_do_not_crash_the_request():
     async with client_for(app) as client:
         response = await client.get(
             "/sse",
-            headers={"Authorization": "Bearer ok:alice", "DPoP": "  spaced-proof  "},
+            headers={"Authorization": "DPoP ok:alice", "DPoP": "  spaced-proof  "},
         )
 
     assert response.status_code == 200
@@ -258,7 +258,7 @@ async def test_required_mode_refuses_a_token_with_no_proof():
     async with client_for(app) as client:
         without = await client.get("/sse", headers={"Authorization": "Bearer ok:alice"})
         with_proof = await client.get(
-            "/sse", headers={"Authorization": "Bearer ok:alice", "DPoP": "p"}
+            "/sse", headers={"Authorization": "DPoP ok:alice", "DPoP": "p"}
         )
 
     assert without.status_code == 401
@@ -351,3 +351,79 @@ def test_request_context_satisfies_the_sdk_protocol():
 def test_capturing_verifier_still_satisfies_the_seam():
     """The protocol change must not have leaked provider specifics into it."""
     assert isinstance(ContextCapturingVerifier(), TokenVerifier)
+
+
+# --------------------------------------------------------------------------
+# How the token is presented, and what the server advertises back.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_proof_under_the_bearer_scheme_is_refused():
+    """RFC 9449 §7.1 pairs a proof with the DPoP scheme, not with Bearer.
+
+    Accepting the pair under `Bearer` would let a sender-constrained token be
+    presented as though it were an ordinary one, which is the ambiguity the
+    scheme exists to remove.
+    """
+    verifier = ContextCapturingVerifier()
+    app = build(verifier)
+
+    async with client_for(app) as client:
+        response = await client.get(
+            "/sse", headers={"Authorization": "Bearer ok:alice", "DPoP": "p"}
+        )
+
+    assert response.status_code == 401
+    assert verifier.contexts == [], "the token should be refused before verification"
+
+
+@pytest.mark.asyncio
+async def test_a_proof_under_the_dpop_scheme_is_accepted():
+    verifier = ContextCapturingVerifier()
+    app = build(verifier)
+
+    async with client_for(app) as client:
+        response = await client.get(
+            "/sse", headers={"Authorization": "DPoP ok:alice", "DPoP": "p"}
+        )
+
+    assert response.status_code == 200
+    assert verifier.contexts[-1].proof == "p"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,expect_bearer,expect_dpop",
+    [("off", True, False), ("optional", True, True), ("required", False, True)],
+)
+async def test_the_challenge_advertises_the_schemes_actually_accepted(
+    mode, expect_bearer, expect_dpop
+):
+    """A client learns from the 401 how it is supposed to authenticate.
+
+    In `required` mode a `Bearer`-only challenge is actively misleading: it names
+    the one scheme that cannot work. Each scheme gets its own header value,
+    because a comma also separates parameters *inside* a challenge and two
+    schemes in one value cannot be parsed unambiguously.
+    """
+    app = build(
+        ContextCapturingVerifier(), dpop=mode, dpop_algorithms=("ES256", "RS256")
+    )
+
+    async with client_for(app) as client:
+        response = await client.get("/sse")
+
+    assert response.status_code == 401
+    challenges = response.headers.get_list("www-authenticate")
+    schemes = {challenge.split(" ", 1)[0] for challenge in challenges}
+
+    assert ("Bearer" in schemes) is expect_bearer
+    assert ("DPoP" in schemes) is expect_dpop
+    for challenge in challenges:
+        assert "resource_metadata=" in challenge, "discovery must survive both schemes"
+    if expect_dpop:
+        dpop_challenge = next(c for c in challenges if c.startswith("DPoP "))
+        assert 'algs="ES256 RS256"' in dpop_challenge, (
+            "RFC 9449 §5.1: tell the client which algorithms to sign with"
+        )

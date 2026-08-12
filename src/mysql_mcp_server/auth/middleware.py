@@ -78,12 +78,32 @@ def is_protected(path: str) -> bool:
     return any(path == p.rstrip("/") or path.startswith(p) for p in PROTECTED_PREFIXES)
 
 
-def bearer_token(headers: Iterable[tuple[bytes, bytes]]) -> tuple[str | None, str | None]:
-    """Extract a bearer token from ``Authorization``. Returns ``(token, error)``.
+ACCEPTED_SCHEMES = ("bearer", "dpop")
+
+
+def bearer_token(
+    headers: Iterable[tuple[bytes, bytes]],
+) -> tuple[str | None, str, str | None]:
+    """Extract the access token from ``Authorization``.
+
+    Returns ``(token, scheme, error)``. The scheme is lowercased and returned
+    alongside the token because RFC 9449 §7.1 makes it load-bearing rather than
+    decorative: a DPoP-bound token has to arrive under the ``DPoP`` scheme, so
+    the caller has to be able to tell which one was used.
 
     Only this header is consulted. A token in the query string would be copied
     into proxy access logs and ``Referer`` headers, which is why the PRM
     document advertises ``bearer_methods_supported: ["header"]``.
+
+    Two schemes are accepted. RFC 9449 §7.1 requires a DPoP-bound access token to
+    be presented as ``Authorization: DPoP <token>``, not as ``Bearer``, so
+    refusing that scheme rejects every conforming DPoP client before its proof is
+    ever looked at -- which made the DPoP support unusable over HTTP even though
+    the proof handling below was correct.
+
+    Accepting ``DPoP`` here does not weaken anything: the scheme only says how
+    the token was presented. Whether a proof is required, and whether it matches,
+    is decided by the verifier from the token's own ``cnf`` claim.
 
     ASGI lowercases header names; the scheme is compared case-insensitively per
     RFC 7235 §2.1, so ``BEARER`` and ``bearer`` are both accepted.
@@ -94,19 +114,20 @@ def bearer_token(headers: Iterable[tuple[bytes, bytes]]) -> tuple[str | None, st
             raw = value
             break
     if raw is None:
-        return None, "Missing Authorization header"
+        return None, "", "Missing Authorization header"
     try:
         decoded = raw.decode("latin-1").strip()
     except UnicodeDecodeError:
-        return None, "Malformed Authorization header"
+        return None, "", "Malformed Authorization header"
 
     scheme, _, token = decoded.partition(" ")
-    if scheme.lower() != "bearer":
+    normalised = scheme.lower()
+    if normalised not in ACCEPTED_SCHEMES:
         safe = "".join(c for c in scheme if c.isprintable())[:20]
-        return None, f"Unsupported authorization scheme {safe!r}; use Bearer"
+        return None, normalised, f"Unsupported authorization scheme {safe!r}; use Bearer or DPoP"
     if not token.strip():
-        return None, "Bearer token is empty"
-    return token.strip(), None
+        return None, normalised, "Access token is empty"
+    return token.strip(), normalised, None
 
 
 class SessionBinding:
@@ -175,10 +196,17 @@ class AuthMiddleware:
         throttle: "FailureThrottle | None" = None,
         resource_url: str = "",
         deny_at_http_layer: bool = False,
+        dpop: str = "off",
+        dpop_algorithms: Iterable[str] = (),
     ) -> None:
         self.app = app
         self.verifier = verifier
         self.realm = realm
+        # Which challenges to advertise on a 401. A client that cannot see a
+        # `DPoP` challenge has no reason to think sender-constrained tokens are
+        # accepted here, which in `required` mode leaves it guessing.
+        self.dpop = dpop
+        self.dpop_algorithms = tuple(dpop_algorithms)
         # Origin this server is reached at, used to reconstruct the URL a DPoP
         # proof is bound to. Falls back to the PRM document's `resource`, which is
         # the same canonical value by definition.
@@ -277,7 +305,16 @@ class AuthMiddleware:
 
         request_context = self._request_context(scope)
 
-        token, header_error = bearer_token(scope.get("headers", []))
+        token, auth_scheme, header_error = bearer_token(scope.get("headers", []))
+        if header_error is None and request_context.proof and auth_scheme != "dpop":
+            # RFC 9449 §7.1: a proof accompanies a DPoP-bound token, and such a
+            # token must be presented under the DPoP scheme. Accepting the pair
+            # under `Bearer` would let a client present a sender-constrained
+            # token as though it were an ordinary one, which is the ambiguity the
+            # scheme exists to remove. The binding itself is enforced by the
+            # verifier from `cnf.jkt`, so this is about the presentation, not a
+            # second line of defence.
+            header_error = "A DPoP proof requires the DPoP authorization scheme"
         if header_error is not None:
             if self.throttle is not None:
                 self.throttle.record_failure(throttle_key)
@@ -531,15 +568,27 @@ class AuthMiddleware:
         scope_hint: tuple[str, ...] = (),
         retry_after: int = 0,
     ) -> None:
-        parts = [
-            f'Bearer realm="{self.realm}"',
+        common = [
             f'error="{error}"',
             f'error_description="{_header_safe(description)}"',
             f'resource_metadata="{self._metadata_url}"',
         ]
         if scope_hint:
-            parts.append(f'scope="{" ".join(scope_hint)}"')
-        challenge = ", ".join(parts)
+            common.append(f'scope="{" ".join(scope_hint)}"')
+
+        # One challenge per acceptable scheme, as separate header values rather
+        # than one comma-joined string: a comma is also the separator *inside* a
+        # challenge, so two schemes in one value cannot be parsed unambiguously.
+        challenges: list[str] = []
+        if self.dpop != "required":
+            challenges.append(", ".join([f'Bearer realm="{self.realm}"'] + common))
+        if self.dpop != "off":
+            dpop_parts = [f'DPoP realm="{self.realm}"'] + common
+            if self.dpop_algorithms:
+                # RFC 9449 §5.1: tells the client which proof algorithms to sign
+                # with, so it does not have to guess and retry.
+                dpop_parts.append(f'algs="{" ".join(self.dpop_algorithms)}"')
+            challenges.append(", ".join(dpop_parts))
 
         logger.info(
             "Rejected %s %s -> %d %s: %s",
@@ -552,9 +601,12 @@ class AuthMiddleware:
         payload = json.dumps({"error": error, "error_description": description}).encode()
         headers = [
             (b"content-type", b"application/json"),
-            (b"www-authenticate", challenge.encode("latin-1", "replace")),
             (b"content-length", str(len(payload)).encode()),
         ]
+        headers.extend(
+            (b"www-authenticate", challenge.encode("latin-1", "replace"))
+            for challenge in challenges
+        )
         if retry_after > 0:
             # Tell a legitimate-but-misconfigured client when to come back,
             # rather than leaving it to hammer and stay throttled.

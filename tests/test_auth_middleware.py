@@ -249,11 +249,34 @@ def test_query_string_token_is_not_accepted():
 
 
 def test_bearer_token_helper_reports_specific_failures():
-    assert bearer_token([]) == (None, "Missing Authorization header")
-    token, error = bearer_token([(b"authorization", b"Bearer abc")])
-    assert (token, error) == ("abc", None)
-    token, error = bearer_token([(b"authorization", b"Basic abc")])
+    assert bearer_token([]) == (None, "", "Missing Authorization header")
+    token, scheme, error = bearer_token([(b"authorization", b"Bearer abc")])
+    assert (token, scheme, error) == ("abc", "bearer", None)
+    token, _, error = bearer_token([(b"authorization", b"Basic abc")])
     assert token is None and "Bearer" in error
+
+
+@pytest.mark.parametrize(
+    "header,expected_scheme",
+    [
+        (b"DPoP abc", "dpop"),
+        (b"dpop abc", "dpop"),
+        (b"Bearer abc", "bearer"),
+        (b"BEARER abc", "bearer"),
+    ],
+)
+def test_a_dpop_bound_token_is_accepted_under_the_dpop_scheme(header, expected_scheme):
+    """RFC 9449 §7.1 presents a bound token as ``Authorization: DPoP <token>``.
+
+    Rejecting that scheme refused every conforming DPoP client with a 401 before
+    its proof was ever examined, which made the whole DPoP feature unusable over
+    HTTP. It went unnoticed because the DPoP tests inject tokens through a fake
+    verifier and never build this header, and RFC 7235 §2.1 makes the comparison
+    case-insensitive so all four spellings must work.
+    """
+    token, scheme, error = bearer_token([(b"authorization", header)])
+
+    assert (token, scheme, error) == ("abc", expected_scheme, None)
 
 
 def test_rejection_reason_cannot_inject_headers():

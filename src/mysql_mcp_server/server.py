@@ -978,6 +978,8 @@ async def _run_sse_server():
                 audit=auth_settings.audit,
                 throttle=failure_throttle,
                 resource_url=auth_settings.resource,
+                dpop=auth_settings.dpop,
+                dpop_algorithms=auth_settings.allowed_algorithms,
             )
         )
 
