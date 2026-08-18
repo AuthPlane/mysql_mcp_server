@@ -34,7 +34,7 @@ sse = [
 # install, which supports 3.11.
 auth = [
     "mysql_mcp_server[sse]",
-    "authplane-sdk==0.2.0",
+    "authplane-sdk==0.3.0",
 ]
 
 [[project.authors]]
