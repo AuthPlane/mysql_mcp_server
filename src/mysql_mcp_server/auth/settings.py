@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 from .protocol import VerifierConfigError
 
@@ -22,6 +23,40 @@ KNOWN_MODES = ("authplane",)
 # existing scope taxonomy should not have to adopt ours.
 DEFAULT_READ_SCOPE = "mysql:read"
 DEFAULT_WRITE_SCOPE = "mysql:write"
+
+
+def canonical_resource(raw: str) -> str:
+    """Normalise trailing-slash form without breaking the root path.
+
+    RFC 3986 treats an empty path as equivalent to ``/`` for an http(s) URI, so
+    any URL library a client uses to build a ``resource=`` parameter
+    re-serialises ``http://host:port`` as ``http://host:port/``. Blindly
+    stripping a trailing slash -- the previous behaviour -- produced a value no
+    conforming client ever sends for a root resource: this server's PRM
+    document and its own ``aud`` check said ``http://localhost:8000``, a real
+    OAuth client said ``http://localhost:8000/``, and the authorization server
+    answered "Unknown Resource" to the mismatch. Reproduced directly against a
+    live Authplane server before this fix; only the ``authorization_code``
+    path exercises it, which is why 58 ``client_credentials``-based tests
+    never caught it -- that grant never asks a URL library to build the
+    request, so nothing there ever re-adds the slash.
+
+    A non-root path is left untouched, trailing slash and all: there the slash
+    is part of the path rather than an artefact of an empty one, and
+    ``http://host/mcp`` and ``http://host/mcp/`` name different resources.
+
+    Not applied to ``AUTHPLANE_ISSUER``: the ``iss`` claim's source of truth is
+    whatever the authorization server itself puts in the token, which by
+    Authplane's own convention is the bare origin with no trailing slash --
+    adding one here would create the same mismatch this fixes, against the
+    other side of the comparison.
+    """
+    if not raw:
+        return raw
+    parts = urlsplit(raw)
+    if not parts.path:
+        parts = parts._replace(path="/")
+    return urlunsplit(parts)
 
 
 @dataclass(frozen=True)
@@ -47,6 +82,18 @@ class AuthSettings:
     dev_mode: bool = False
     realm: str = "mysql_mcp_server"
 
+    def __post_init__(self) -> None:
+        """Canonicalise the resource URI on *every* construction path.
+
+        Doing this in ``from_env`` alone was a bug: the test harness builds
+        settings directly, so it kept the un-canonicalised form and disagreed
+        with the running server about what the audience is. Anything that
+        constructs settings by hand -- tests, an embedding application -- has
+        the same need, and a value that depends on which constructor was used
+        is exactly the kind of mismatch this whole fix exists to prevent.
+        """
+        object.__setattr__(self, "resource", canonical_resource(self.resource))
+
     @classmethod
     def from_env(cls) -> "AuthSettings":
         mode = os.getenv("MCP_AUTH_MODE", "none").strip().lower()
@@ -59,7 +106,7 @@ class AuthSettings:
             )
 
         issuer = os.getenv("AUTHPLANE_ISSUER", "").strip().rstrip("/")
-        resource = os.getenv("AUTHPLANE_RESOURCE", "").strip().rstrip("/")
+        resource = canonical_resource(os.getenv("AUTHPLANE_RESOURCE", "").strip())
         missing = [
             name
             for name, value in (

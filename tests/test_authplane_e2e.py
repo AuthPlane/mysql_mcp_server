@@ -29,11 +29,12 @@ from contextlib import asynccontextmanager, contextmanager
 import pytest
 
 from authplane_harness import (
-    DECOY_RESOURCE,
+    DECOY_RESOURCE_AUD,
     DECOY_SCOPE,
     ISSUER,
     READ_SCOPE,
     RESOURCE,
+    RESOURCE_AUD,
     WRITE_SCOPE,
     LiveAuthplane,
     new_dpop_provider,
@@ -90,8 +91,8 @@ requires_mysql = pytest.mark.skipif(
 @pytest.fixture(scope="session")
 def live():
     harness = LiveAuthplane()
-    harness.ensure_resource("mysql-mcp-server", RESOURCE, (READ_SCOPE, WRITE_SCOPE))
-    harness.ensure_resource("decoy", DECOY_RESOURCE, (DECOY_SCOPE,))
+    harness.ensure_resource("mysql-mcp-server", RESOURCE_AUD, (READ_SCOPE, WRITE_SCOPE))
+    harness.ensure_resource("decoy", DECOY_RESOURCE_AUD, (DECOY_SCOPE,))
     try:
         yield harness
     finally:
@@ -239,7 +240,7 @@ def test_the_metadata_document_is_public(server):
 
     assert response.status_code == 200, "a client cannot obtain a token without this"
     document = response.json()
-    assert document["resource"] == RESOURCE
+    assert document["resource"] == RESOURCE_AUD
     assert document["bearer_methods_supported"] == ["header"]
 
 
@@ -322,7 +323,7 @@ def test_a_token_for_another_resource_is_refused(server, live):
     import httpx
 
     decoy = live.mint(
-        live.new_client("e2e-decoy", DECOY_SCOPE), DECOY_SCOPE, resource=DECOY_RESOURCE
+        live.new_client("e2e-decoy", DECOY_SCOPE), DECOY_SCOPE, resource=DECOY_RESOURCE_AUD
     )
 
     response = httpx.get(SSE_URL, headers={"Authorization": f"Bearer {decoy}"}, timeout=10)

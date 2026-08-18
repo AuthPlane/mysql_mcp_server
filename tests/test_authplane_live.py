@@ -18,10 +18,11 @@ from contextlib import asynccontextmanager
 import pytest
 
 from authplane_harness import (
-    DECOY_RESOURCE,
+    DECOY_RESOURCE_AUD,
     DECOY_SCOPE,
     READ_SCOPE,
     RESOURCE,
+    RESOURCE_AUD,
     WRITE_SCOPE,
     LiveAuthplane,
     claims_of,
@@ -61,8 +62,8 @@ async def verifier(**overrides):
 @pytest.fixture(scope="session")
 def live():
     harness = LiveAuthplane()
-    harness.ensure_resource("mysql-mcp-server", RESOURCE, (READ_SCOPE, WRITE_SCOPE))
-    harness.ensure_resource("decoy", DECOY_RESOURCE, (DECOY_SCOPE,))
+    harness.ensure_resource("mysql-mcp-server", RESOURCE_AUD, (READ_SCOPE, WRITE_SCOPE))
+    harness.ensure_resource("decoy", DECOY_RESOURCE_AUD, (DECOY_SCOPE,))
     try:
         yield harness
     finally:
@@ -165,8 +166,8 @@ async def test_a_token_minted_for_another_resource_is_refused(live, decoy_client
     stops a token issued for some other service being replayed against the
     database.
     """
-    decoy = live.mint(decoy_client, DECOY_SCOPE, resource=DECOY_RESOURCE)
-    assert claims_of(decoy)["aud"] == [DECOY_RESOURCE], "the decoy really is for another audience"
+    decoy = live.mint(decoy_client, DECOY_SCOPE, resource=DECOY_RESOURCE_AUD)
+    assert claims_of(decoy)["aud"] == [DECOY_RESOURCE_AUD], "the decoy really is for another audience"
 
     async with verifier() as v:
         with pytest.raises(AuthenticationError):
@@ -433,7 +434,7 @@ async def test_the_metadata_document_describes_this_resource():
         document = v.protected_resource_metadata()
         url = v.metadata_url()
 
-    assert document["resource"] == RESOURCE, "must match the token 'aud' byte-for-byte"
+    assert document["resource"] == RESOURCE_AUD, "must match the token 'aud' byte-for-byte"
     assert document["authorization_servers"], "a client cannot find the AS without this"
     assert document["bearer_methods_supported"] == ["header"], (
         "advertising query-string tokens would invite them into proxy logs"

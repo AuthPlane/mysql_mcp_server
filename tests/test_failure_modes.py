@@ -124,18 +124,47 @@ def test_identical_read_and_write_scopes_are_refused(clean_env):
         AuthSettings.from_env()
 
 
-def test_trailing_slashes_are_normalised(clean_env):
-    """The Resource URI must match the token's `aud` byte-for-byte.
+def test_issuer_trailing_slash_is_stripped(clean_env):
+    """The issuer must match the token's `iss` byte-for-byte.
 
-    A trailing slash is the second most common cause of an opaque
-    `invalid_token`, so it is stripped rather than left to bite.
+    Unlike the resource (below), the issuer's source of truth is whatever
+    Authplane itself puts in the token, and by its own convention that is the
+    bare origin with no trailing slash -- so stripping one here is correct.
     """
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
     clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000/")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000/")
+    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
     settings = AuthSettings.from_env()
     assert settings.issuer == "http://localhost:9000"
-    assert settings.resource == "http://localhost:8000"
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        # A root resource always gains the trailing slash: RFC 3986 treats an
+        # empty path as equivalent to `/`, so any URL library a real OAuth
+        # client uses to build its `resource=` parameter produces the
+        # slash form. Reproduced directly against a live Authplane server:
+        # a client requesting `http://localhost:8000/` was refused with
+        # "Unknown Resource" when this server's own settings said
+        # `http://localhost:8000` -- both are the same resource, but the
+        # authorization server compares strings, not URIs.
+        ("http://localhost:8000", "http://localhost:8000/"),
+        ("http://localhost:8000/", "http://localhost:8000/"),
+        # A non-root path is left exactly as given in both directions: the
+        # slash there is part of the path, not an artefact of an empty one,
+        # and `.../mcp` and `.../mcp/` are different resources.
+        ("http://localhost:8000/mcp", "http://localhost:8000/mcp"),
+        ("http://localhost:8000/mcp/", "http://localhost:8000/mcp/"),
+    ],
+)
+def test_resource_root_path_is_canonicalised(clean_env, given, expected):
+    """The Resource URI must match what a real client sends, byte-for-byte."""
+    clean_env.setenv("MCP_AUTH_MODE", "authplane")
+    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
+    clean_env.setenv("AUTHPLANE_RESOURCE", given)
+    settings = AuthSettings.from_env()
+    assert settings.resource == expected
 
 
 def test_http_issuer_warns_outside_dev_mode(clean_env, caplog):

@@ -43,8 +43,24 @@ _HAS_HTTPX = importlib.util.find_spec("httpx") is not None
 ISSUER = os.getenv("AUTHPLANE_TEST_ISSUER", "").strip().rstrip("/")
 ADMIN_URL = os.getenv("AUTHPLANE_TEST_ADMIN_URL", "").strip().rstrip("/")
 ADMIN_KEY = os.getenv("AUTHPLANE_TEST_ADMIN_KEY", "").strip()
+#: Base URL, with no trailing slash, for *building request URLs*
+#: (``f"{RESOURCE}/messages/"``). Distinct from the identifier below.
 RESOURCE = os.getenv("AUTHPLANE_TEST_RESOURCE", "http://localhost:8000").strip().rstrip("/")
 DECOY_RESOURCE = os.getenv("AUTHPLANE_TEST_DECOY_RESOURCE", "http://localhost:9999").strip().rstrip("/")
+
+#: The same resources as *identifiers*: what is registered at the authorization
+#: server, sent as ``resource=``, carried in ``aud``, and published in the PRM
+#: document. For a root resource this is the base URL plus the ``/`` that RFC
+#: 3986 makes part of its canonical form, so the two differ by exactly that
+#: character and must not be used interchangeably.
+#:
+#: Imported from the production helper rather than recomputed here: these values
+#: have to agree with what the running server derives, and a second
+#: implementation is a second thing to keep in sync.
+from mysql_mcp_server.auth.settings import canonical_resource  # noqa: E402
+
+RESOURCE_AUD = canonical_resource(RESOURCE)
+DECOY_RESOURCE_AUD = canonical_resource(DECOY_RESOURCE)
 
 READ_SCOPE = "mysql:read"
 WRITE_SCOPE = "mysql:write"
@@ -111,7 +127,26 @@ class LiveAuthplane:
         )
         existing.raise_for_status()
         for resource in existing.json():
+            if resource.get("uri", "") == uri:
+                return
             if resource.get("uri", "").rstrip("/") == uri.rstrip("/"):
+                # Same resource, registered under the other trailing-slash form.
+                # Compared exactly above and repaired here rather than tolerated:
+                # the authorization server matches this string exactly, so a
+                # registration that differs by the slash is not an equivalent
+                # spelling, it is a resource that cannot be minted for. Left
+                # alone, every token request fails with "unknown resource".
+                patch = self._httpx.patch(
+                    f"{ADMIN_URL}/admin/resources/{resource['id']}",
+                    headers=self._admin_headers,
+                    timeout=20,
+                    json={"uri": uri},
+                )
+                if patch.status_code >= 300:
+                    raise RuntimeError(
+                        f"could not repair resource {slug} URI to {uri}: "
+                        f"{patch.status_code} {patch.text}"
+                    )
                 return
 
         response = self._httpx.post(
@@ -172,7 +207,7 @@ class LiveAuthplane:
         form = {
             "grant_type": "client_credentials",
             "scope": scope,
-            "resource": resource or RESOURCE,
+            "resource": resource or RESOURCE_AUD,
         }
 
         def post(extra_headers: dict) -> Any:
@@ -280,7 +315,7 @@ def settings_for(**overrides):
         enabled=True,
         mode="authplane",
         issuer=ISSUER,
-        resource=RESOURCE,
+        resource=RESOURCE_AUD,
         scopes=(READ_SCOPE, WRITE_SCOPE),
         read_scope=READ_SCOPE,
         write_scope=WRITE_SCOPE,
