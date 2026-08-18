@@ -306,6 +306,11 @@ class AuthMiddleware:
         request_context = self._request_context(scope)
 
         token, auth_scheme, header_error = bearer_token(scope.get("headers", []))
+        # Recorded before any decision is taken, so a refusal is auditable with
+        # the same detail as an acceptance: what scheme was tried, and whether a
+        # proof came with it.
+        scope["auth_scheme"] = auth_scheme
+        scope["auth_dpop_proof"] = request_context.proof is not None
         if header_error is None and request_context.proof and auth_scheme != "dpop":
             # RFC 9449 §7.1: a proof accompanies a DPoP-bound token, and such a
             # token must be presented under the DPoP scheme. Accepting the pair
@@ -395,10 +400,6 @@ class AuthMiddleware:
     async def _stream_with_binding(
         self, scope: dict, receive: Callable, send: Callable, identity: Identity
     ) -> None:
-        if not self.bind_session_to_subject:
-            await self.app(scope, receive, send)
-            return
-
         seen = False
 
         async def sniffing_send(message: Mapping[str, Any]) -> None:
@@ -408,12 +409,29 @@ class AuthMiddleware:
                 session_id = _session_id_from_endpoint_event(body)
                 if session_id:
                     seen = True
-                    self.sessions.remember(session_id, identity.subject)
-                    logger.debug(
-                        "Bound session %s to %s", session_id, identity.describe()
+                    if self.bind_session_to_subject:
+                        self.sessions.remember(session_id, identity.subject)
+                        logger.debug(
+                            "Bound session %s to %s", session_id, identity.describe()
+                        )
+                    # The only record of a *successful* authentication. Every
+                    # other audit event fires on a denial or on a tool call, so
+                    # without this the trail shows who was refused and who ran
+                    # SQL, but never who merely connected -- and a session id
+                    # that appears in later records with no origin.
+                    self._audit(
+                        audit.EVENT_STREAM_OPENED,
+                        scope,
+                        identity=identity,
+                        session_id=session_id,
+                        outcome="authenticated",
                     )
             await send(message)
 
+        # The sniffer runs whether or not binding is on: it is also what
+        # observes the session id for the audit record above, and reading one
+        # line out of the first body chunk costs nothing on a stream that then
+        # runs untouched.
         await self.app(scope, receive, sniffing_send)
 
     async def _handle_post(

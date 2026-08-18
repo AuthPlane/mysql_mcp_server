@@ -74,6 +74,7 @@ class AuthSettings:
     client_id: str = ""
     client_secret: str = ""
     audit: bool = True
+    audit_file: str = ""
     throttle_failures: int = 0
     throttle_window_seconds: float = 60.0
     dpop: str = "off"
@@ -255,6 +256,7 @@ class AuthSettings:
             mode=mode,
             dpop=dpop,
             audit=_flag("MCP_AUTH_AUDIT", True),
+            audit_file=os.getenv("MCP_AUTH_AUDIT_FILE", "").strip(),
             throttle_failures=throttle_failures,
             throttle_window_seconds=throttle_window,
             revocation_check=revocation_check,

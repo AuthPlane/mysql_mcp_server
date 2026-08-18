@@ -419,3 +419,113 @@ def test_invalid_throttle_settings_fail_at_startup(monkeypatch, value):
 
     with pytest.raises(VerifierConfigError):
         AuthSettings.from_env()
+
+
+# --------------------------------------------------------------------------
+# Denials decided in the *tool* layer.
+#
+# The middleware records `tool_call_authorized` once a request clears
+# authentication and the HTTP-layer checks, but the per-tool scope and statement
+# decisions are taken in `call_tool`, in a different task. Until these records
+# existed, a refused call appeared in the trail as `tool_call_authorized` and the
+# refusal only in the server log -- so the audit over-reported permission, which
+# is the one direction it must never err in. Found three times over against a
+# real MCP client before being fixed.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def tool_layer(monkeypatch):
+    """Drive `call_tool` as the SSE transport does: identity bound, auth on."""
+    from mysql_mcp_server import server as server_module
+    from mysql_mcp_server.auth import current
+
+    monkeypatch.setattr(server_module, "AUDIT_ENABLED", True)
+    monkeypatch.setattr(
+        server_module,
+        "REQUIRED_SCOPES",
+        server_module.tool_scope_map("mysql:read", "mysql:write"),
+    )
+
+    async def run(identity, name, arguments):
+        # Awaited inside the binding, not merely started: returning the coroutine
+        # would reset the identity before the handler ever ran, and every
+        # assertion below would then be measuring the unauthenticated path.
+        token = current.set_identity(identity)
+        try:
+            return await server_module.call_tool(name, arguments)
+        finally:
+            current.reset_identity(token)
+
+    return run
+
+
+def _identity(*scopes):
+    return Identity(
+        subject="alice", scopes=frozenset(scopes), client_id="cli", token_id="jti-1"
+    )
+
+
+async def test_a_scope_denial_in_the_tool_layer_is_audited(tool_layer, audit_records):
+    with pytest.raises(Exception):
+        await tool_layer(
+            _identity("mysql:read"), "write_query", {"query": "DROP TABLE t"}
+        )
+
+    entries = [e for e in audit_records() if e["event"] == "tool_call_denied_scope"]
+    assert len(entries) == 1, "the refusal must appear in the trail, not only the log"
+    entry = entries[0]
+    assert entry["outcome"] == "denied"
+    assert entry["sub"] == "alice"
+    assert entry["tool"] == "write_query"
+    assert entry["statement"] == "DROP TABLE t"
+    assert "mysql:write" in entry["reason"]
+    assert not [e for e in audit_records() if e["event"] == "tool_call_authorized"]
+
+
+async def test_a_statement_denial_in_the_tool_layer_is_audited(tool_layer, audit_records):
+    """Correctly scoped, still refused: classification, not authorization.
+
+    Recorded under a different event from the scope denial because the two are
+    different findings for whoever reads the trail -- one is a caller without
+    permission, the other a caller with permission sending something the tool
+    does not accept.
+    """
+    with pytest.raises(Exception):
+        await tool_layer(
+            _identity("mysql:read", "mysql:write"),
+            "read_query",
+            {"query": "DROP TABLE t"},
+        )
+
+    entries = [e for e in audit_records() if e["event"] == "tool_call_denied_statement"]
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "read_query"
+    assert entries[0]["outcome"] == "denied"
+
+
+async def test_the_tool_layer_does_not_audit_when_auditing_is_off(
+    tool_layer, audit_records, monkeypatch
+):
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setattr(server_module, "AUDIT_ENABLED", False)
+    with pytest.raises(Exception):
+        await tool_layer(
+            _identity("mysql:read"), "write_query", {"query": "DROP TABLE t"}
+        )
+    assert audit_records() == []
+
+
+async def test_stdio_has_no_identity_and_is_not_audited(tool_layer, audit_records):
+    """No identity means authorization does not apply, not that it was denied.
+
+    The stdio transport has no HTTP layer and no token. A refusal there is still
+    a refusal, but it belongs to nobody, so it must not produce a record naming a
+    subject -- and enabling auth must not become the only way to use the server.
+    """
+    with pytest.raises(Exception):
+        await tool_layer(None, "read_query", {"query": "DROP TABLE t"})
+
+    entries = [e for e in audit_records() if e["event"].startswith("tool_call_denied")]
+    assert entries, "the denial is still recorded"
+    assert "sub" not in entries[0], "but not attributed to a subject"

@@ -20,6 +20,7 @@ from mcp.types import (
 from pydantic import AnyUrl
 from dotenv import load_dotenv
 
+from .auth import audit as audit_log
 from .auth.current import get_identity as current_identity
 from .sqlguard import DENIAL_MESSAGE, Kind, StatementDenied, classify, is_denial
 
@@ -229,6 +230,46 @@ READ_ONLY_TOOLS = ("read_query",)
 # without reaching into auth settings. Populated from the configured scope names
 # at startup; the defaults match the documented ones.
 REQUIRED_SCOPES: dict = {}
+
+# Whether the tool layer writes audit records. Set at startup alongside
+# REQUIRED_SCOPES, for the same reason: the tool layer enforces authorization but
+# has no access to auth settings, and it must not start auditing merely because
+# an identity happens to be present.
+AUDIT_ENABLED = False
+
+
+def record_denial(event: str, identity, tool: str, arguments: dict, reason: str) -> None:
+    """Audit a tool call this layer refused.
+
+    The middleware records ``tool_call_authorized`` once a request clears
+    authentication and the HTTP-layer checks, but the per-tool decisions happen
+    *here* -- and until now a refusal left no audit record at all, only a log
+    line. The trail therefore said "authorized" for calls that were then refused
+    on scope or on statement classification, which is the one direction an audit
+    trail must never err in. Observed three separate times against a real client
+    before this was added.
+
+    No ASGI scope is available in this task, so ``method``, ``path`` and
+    ``client`` are absent from these records rather than guessed. The stream's
+    own request carries them, and it is already audited as ``stream_opened``;
+    the ``session_id`` there is what ties the two together.
+    """
+    if not AUDIT_ENABLED:
+        return
+    statement = ""
+    if isinstance(arguments, dict):
+        candidate = arguments.get("query")
+        if isinstance(candidate, str):
+            statement = candidate
+    audit_log.record(
+        event,
+        {},
+        identity=identity,
+        tool=tool,
+        statement=statement,
+        outcome="denied",
+        reason=reason,
+    )
 
 
 def tool_scope_map(read_scope: str, write_scope: str) -> dict:
@@ -525,6 +566,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """
     Dispatches tool calls from AI agents to the appropriate implementation logic.
     """
+    # Resolved before the try so the handler below can always reach them, and so
+    # a denial is attributed to the right identity even if it is raised deeper in.
+    identity = current_identity()
+    denial_event = audit_log.EVENT_DENIED_STATEMENT
+
     try:
         logger.info(f"Calling tool: {name} with arguments: {arguments}")
 
@@ -537,7 +583,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # No identity means authorization does not apply -- stdio (no HTTP layer,
         # no token) or auth switched off. It must not mean "denied", or enabling
         # auth would become the only way to use the server.
-        identity = current_identity()
         if identity is not None:
             required = REQUIRED_SCOPES.get(name, REQUIRED_SCOPES.get("*", ()))
             missing = [s for s in required if not identity.has_scope(s)]
@@ -546,6 +591,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "Denied %s for %s: missing scope(s) %s",
                     name, identity.describe(), ", ".join(missing),
                 )
+                denial_event = audit_log.EVENT_DENIED_SCOPE
                 raise StatementDenied(
                     f"'{name}' requires the {' '.join(required)} scope. This token "
                     f"grants: {' '.join(sorted(identity.scopes)) or 'nothing'}."
@@ -615,6 +661,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # design, for unexpected failures -- would present a refusal as a
         # successful answer.
         logger.info("Denied tool call %s: %s", name, e)
+        record_denial(denial_event, identity, name, arguments, str(e))
         raise
     except Exception as e:
         logger.error(f"Error in call_tool: {str(e)}")
@@ -935,6 +982,9 @@ async def _run_sse_server():
 
         from .auth import PRM_PATH, AuthMiddleware, build_verifier
 
+        global AUDIT_ENABLED
+        AUDIT_ENABLED = auth_settings.audit
+
         REQUIRED_SCOPES.clear()
         REQUIRED_SCOPES.update(
             tool_scope_map(auth_settings.read_scope, auth_settings.write_scope)
@@ -984,6 +1034,21 @@ async def _run_sse_server():
         )
 
         if auth_settings.audit:
+            if auth_settings.audit_file:
+                from .auth import audit as audit_log
+
+                try:
+                    audit_log.to_file(auth_settings.audit_file)
+                except OSError as exc:
+                    # Not fatal: an unwritable audit path should be loud, not a
+                    # reason to refuse to serve. The records still reach stderr.
+                    logger.error(
+                        "Could not open MCP_AUTH_AUDIT_FILE=%s (%s); audit records "
+                        "go to stderr only.",
+                        auth_settings.audit_file, exc,
+                    )
+                else:
+                    logger.info("Audit records also written to %s", auth_settings.audit_file)
             logger.info(
                 "Audit records enabled on logger 'mysql_mcp_server.audit' (one JSON "
                 "object per line). Each authorized tool call records sub, client_id, "

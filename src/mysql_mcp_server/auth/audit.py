@@ -53,6 +53,26 @@ EVENT_STREAM_OPENED = "stream_opened"
 EVENT_THROTTLED = "authentication_throttled"
 
 
+def to_file(path: str) -> None:
+    """Also write audit records to ``path``, one JSON object per line.
+
+    Without this the records land on whatever handler the root logger has, which
+    in this server means stderr, interleaved with uvicorn's access log and every
+    diagnostic. That is fine for a glance and useless for anything else: an
+    operator wanting the trail wants *only* the trail, in a file something else
+    can read.
+
+    Propagation is left on, so the records still appear on stderr. The file
+    handler formats the message alone -- the record is already a complete JSON
+    object, and prefixing it with a timestamp and a level would stop it being
+    one.
+    """
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger.addHandler(handler)
+    audit_logger.setLevel(logging.INFO)
+
+
 def _client_address(scope: Mapping[str, Any]) -> str:
     """Best-effort peer address.
 
@@ -100,6 +120,17 @@ def record(
             "path": scope.get("path", ""),
             "client": _client_address(scope),
         }
+        # How the credential was presented, not just that it was accepted.
+        # Written by the middleware onto the ASGI scope as soon as the
+        # Authorization header is parsed, so a 401 carries it too. Without this
+        # a record cannot distinguish a bearer token from a sender-constrained
+        # one -- which makes "is DPoP actually in effect here?" unanswerable
+        # from the trail, the one place it should be obvious.
+        scheme = scope.get("auth_scheme")
+        if scheme:
+            entry["scheme"] = scheme
+        if "auth_dpop_proof" in scope:
+            entry["dpop_proof"] = bool(scope.get("auth_dpop_proof"))
         if identity is not None:
             entry["sub"] = getattr(identity, "subject", "") or ""
             entry["client_id"] = getattr(identity, "client_id", "") or ""
