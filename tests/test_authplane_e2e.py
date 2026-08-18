@@ -139,13 +139,27 @@ def running_server(log_path, port: int, dpop: str):
         "MCP_SSE_PORT": str(port),
         "MCP_AUTH_MODE": "authplane",
         "AUTHPLANE_ISSUER": ISSUER,
-        "AUTHPLANE_RESOURCE": RESOURCE,
+        "AUTHPLANE_RESOURCE": RESOURCE_AUD,
         "AUTHPLANE_DEV_MODE": "true",
         "MCP_AUTH_DPOP": dpop,
+        # Pinned, not inherited. The server calls `load_dotenv()`, which does not
+        # override variables already set here but does supply any that are
+        # missing -- so a developer's local `.env` silently became part of the
+        # test configuration. Both of these have to be fixed for the assertions
+        # below to mean anything:
+        #
+        #   throttling: several tests deliberately present a run of bad tokens
+        #   and assert 401. With a throttle configured, the later ones get 429
+        #   and the suite fails in a way that looks like broken authentication.
+        "MCP_AUTH_MAX_AUTH_FAILURES": "0",
         "PYTHONUNBUFFERED": "1",
     }
     environment.pop("MYSQL_RO_USER", None)
     environment.pop("MYSQL_RO_PASSWORD", None)
+    #   audit file: inherited, every e2e run appends to whatever file the
+    #   developer is tailing. Records still reach stderr, which is captured in
+    #   this server's own log.
+    environment.pop("MCP_AUTH_AUDIT_FILE", None)
 
     base = f"http://127.0.0.1:{port}"
 
