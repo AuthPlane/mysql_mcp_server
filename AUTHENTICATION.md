@@ -152,7 +152,7 @@ Names in the `AUTHPLANE_*` namespace follow the SDK's own documentation; the
 | `AUTHPLANE_CLIENT_ID` | — | This server's client id, required for revocation checks |
 | `AUTHPLANE_CLIENT_SECRET` | — | Matching secret |
 | `AUTHPLANE_REALM` | `mysql_mcp_server` | Realm in the `WWW-Authenticate` challenge |
-| `AUTHPLANE_DEV_MODE` | `false` | Relaxes SDK checks for local development. Also silences the `http://` issuer warning |
+| `AUTHPLANE_DEV_MODE` | `false` | **Required** to boot against an `http://` issuer at all -- not merely to silence a warning. The SDK's SSRF guard refuses to fetch discovery or JWKS from a non-`https`, non-public host unless this is set; without it, startup fails with `Could not reach the authorization server`, which reads like the AS is down even when it is not. Needed for any `localhost` or `127.0.0.1` issuer, i.e. every local development setup |
 | `MYSQL_SCOPE_READ` | `mysql:read` | Scope the read tools require |
 | `MYSQL_SCOPE_WRITE` | `mysql:write` | Scope the write tools require |
 | `MCP_AUTH_ENFORCE_SCOPES` | `true` | Set `false` to authenticate without per-tool scope checks |
@@ -160,8 +160,24 @@ Names in the `AUTHPLANE_*` namespace follow the SDK's own documentation; the
 | `MCP_AUTH_REVOCATION_CHECK` | `false` | Per-request introspection. Requires the client id and secret |
 | `MCP_AUTH_BIND_SESSION` | `true` | Bind each SSE session to the subject that opened it |
 | `MCP_AUTH_AUDIT` | `true` | Emit structured audit records |
+| `MCP_AUTH_AUDIT_FILE` | — | Also write audit records to this file, one JSON object per line. Unset: records go to stderr only, interleaved with the access log |
 | `MCP_AUTH_MAX_AUTH_FAILURES` | `0` | Throttle after N failures. `0` disables |
 | `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `60` | Window for the failure count |
+
+### Local development against `http://`
+
+```dotenv
+MCP_AUTH_MODE=authplane
+AUTHPLANE_ISSUER=http://localhost:9000
+AUTHPLANE_RESOURCE=http://localhost:8000
+AUTHPLANE_DEV_MODE=true
+```
+
+`AUTHPLANE_DEV_MODE=true` relaxes three SSRF-guard restrictions the SDK
+otherwise enforces unconditionally: `allow_http`, `allow_localhost`, and
+`allow_private_networks`. All three matter for a bare `localhost` issuer --
+switching the URL to `https://localhost:9000` is not enough on its own,
+because `allow_localhost` is what is actually blocking the fetch.
 
 Misconfiguration is fatal at startup rather than per request. An unrecognised
 mode, a missing issuer, identical read and write scopes, a negative clock skew,
@@ -203,6 +219,32 @@ stolen token alone is not enough.
 protection, clients that do not keep working. `required` locks out every client
 that cannot produce a proof, which today is most MCP clients. Setting it logs a
 warning at startup.
+
+### Client support is the deciding factor, and it is thin
+
+DPoP requires the *client* to sign a fresh proof per request. No amount of
+server-side configuration provides it. Measured against Claude Code 2.1.234 as a
+real MCP client, over the browser consent flow:
+
+| `MCP_AUTH_DPOP` | What the client did |
+|---|---|
+| `optional` | Connected as `Bearer`, no proof — even though the metadata document advertised `ES256`/`RS256` support |
+| `required` | Could not connect at all. Refused with `401` before any tool call |
+
+The audit trail is where you read this: `"scheme":"bearer","dpop_proof":false` on
+a `stream_opened` record means the client is not using DPoP, whatever the server
+advertises.
+
+So `required` is a decision about your clients, not about your security posture:
+turning it on with a bearer-only client is an outage, and the failure is
+"nothing connects", not "something is less secure". Verify every client can
+produce a proof before setting it. The 401 does its part — the challenge names
+the `DPoP` scheme and its accepted `algs`, so a client that *could* comply has
+what it needs — but a client that cannot simply stays out.
+
+The positive path (a bound token, a verified proof, replay detection) is covered
+by `tests/test_authplane_e2e.py`, which signs proofs with the SDK's own
+`DPoPProvider` because no MCP client available today does it over this transport.
 
 `optional` applies to the client's choice of token, not to the token's own
 binding. Once Authplane has bound a token to a key it carries a `cnf.jkt` claim,
@@ -263,6 +305,56 @@ Checks fail closed. If the question "is this token still valid?" cannot be
 answered, the request is refused. For a server that executes SQL, an unanswerable
 revocation check should not mean "allow".
 
+### "Immediate" is only as immediate as the authorization server makes it
+
+This server asks Authplane on every request and honours the answer at once. What
+it cannot do is make Authplane consider a token revoked. Verified against
+Authplane 0.1.1: revoking a *consent grant*
+(`authserver admin grant revoke-consent`) updates its issuance audit table but
+does not add the token to the blacklist that `/oauth/introspect` consults, so the
+token keeps passing introspection — and therefore keeps working here — until it
+expires. `authserver admin user force-logout` does write to that blacklist, and a
+token revoked that way is refused here on the next request.
+
+The practical consequence is worth stating plainly: with revocation checking on,
+"cut this client off now" works only through a revocation path the authorization
+server actually propagates to introspection. Confirm which of yours do.
+
+There is also no way to withdraw *one* scope from a live token, here or upstream.
+An access token is a signed JWT: once issued carrying `mysql:read mysql:write`,
+nothing server-side can edit it. The only lever is revoking it and having the
+client obtain a new one with fewer scopes granted.
+
+### Cutting a client off completely
+
+Two separate things have to be revoked, and revoking either one alone leaves a
+gap. Against Authplane:
+
+```bash
+# 1. Kill the live tokens. Without this the current access token keeps working
+#    until it expires, even though the client can no longer obtain a new one.
+authserver admin user force-logout --id <user_id>
+
+# 2. Revoke the consent. Without this the authorization server still considers
+#    the user's approval standing, so the next connection is granted silently
+#    with no consent screen -- and with the same scopes as before.
+authserver admin grant revoke-consent --id <consent_grant_id>
+```
+
+Deleting the client's local token cache is *not* revocation. It stops that
+installation from using the token; it does nothing about a copy of the token
+elsewhere, which stays valid until it expires. If the concern is that a token
+leaked, only step 1 addresses it.
+
+Step 2 is also how you force the consent screen to reappear — useful when
+re-granting a *narrower* set of scopes, since a standing consent is reused
+without asking.
+
+Note that a consent grant id is reused when the same user re-approves the same
+client and resource: the record moves back from revoked to active rather than a
+new one being created. An audit process keyed on grant id cannot assume "this
+grant was revoked on date X" still holds.
+
 ## Session binding
 
 With `MCP_AUTH_BIND_SESSION=true` (the default) an SSE session is bound to the
@@ -274,9 +366,26 @@ single-process deployment and is an architectural limit, not a missing feature.
 
 ## Auditing
 
-With `MCP_AUTH_AUDIT=true` (the default) every authorized tool call and every
-denial is written to the `mysql_mcp_server.audit` logger as one JSON object per
-line, carrying the subject, client id, token id (`jti`), tool name and statement.
+With `MCP_AUTH_AUDIT=true` (the default) tool calls, stream opens and
+authentication denials are written to the `mysql_mcp_server.audit` logger as one
+JSON object per line, carrying the subject, client id, token id (`jti`), tool
+name, statement, and how the credential was presented (`scheme`, `dpop_proof`).
+Set `MCP_AUTH_AUDIT_FILE` to also write them to a file of their own.
+
+Per-tool refusals are recorded where they are decided — in the tool handler —
+as `tool_call_denied_scope` (the caller lacks the scope) or
+`tool_call_denied_statement` (correctly scoped, but the statement is not one this
+tool accepts). Those records carry no `method`, `path` or `client`: the handler
+runs in the stream's task with no request attached, so those fields are omitted
+rather than guessed. The `stream_opened` record for the same `session_id` has
+them.
+
+`tool_call_authorized` therefore still means "this call cleared authentication
+and the HTTP-layer checks", and a refusal that follows appears as its own record.
+One case remains outside this server's reach: a call the MCP layer itself rejects
+— an uninitialised session, for instance — is authorized here, accepted by the
+transport, and refused after that, leaving only the `tool_call_authorized`
+record.
 
 ```python
 import logging
@@ -301,6 +410,14 @@ caller shares one bucket, which makes the throttle either useless or a
 self-inflicted outage. `X-Forwarded-For` is deliberately not trusted. General
 rate limiting belongs in a proxy; this is not an attempt at one.
 
+It earns its place against a misconfigured client rather than an attacker. A
+client that cannot authenticate does not necessarily back off: measured against
+Claude Code refused by `MCP_AUTH_DPOP=required`, it retried in a tight loop at
+roughly 14 requests per second — 2,000 failed authentications in three minutes,
+each one a signature verification on this server and, with revocation checking
+on, an introspection round trip to the authorization server. Enabling the
+throttle turns that into a handful of 401s and then 429s carrying `Retry-After`.
+
 ## Known limits
 
 - DNS-rebinding protection (`MCP_SSE_ALLOWED_HOSTS`) is independent of
@@ -309,8 +426,21 @@ rate limiting belongs in a proxy; this is not an attempt at one.
 - The repo ships no CORS middleware, so a browser-based client cannot use this
   server regardless of authentication. This predates this feature.
 - Session binding is per process, as described above.
-- The browser consent flow (`authorization_code` with a human approving) has not
-  been exercised end to end. Machine-to-machine `client_credentials` has.
+- Revoking a token upstream only takes effect here if the authorization server
+  propagates that revocation to its introspection endpoint. See
+  [Revocation](#revocation) — not every revocation path in Authplane does.
+- A single scope cannot be withdrawn from a live token. Revoke and re-consent is
+  the only path.
+- If every token starts failing as `invalid_token` right after a key rotation,
+  check `/.well-known/jwks.json` lists the new `kid` before looking here: an
+  authorization server that signs with a key it does not publish cannot be
+  verified by anything. Observed with Authplane 0.1.1 when rotating via its CLI
+  rather than its admin API.
+- A tool call the MCP layer refuses after this server has authorized it — an
+  uninitialised session, say — leaves a `tool_call_authorized` record and no
+  refusal record, because the refusal happens past the point where any identity
+  is available. Scope and statement refusals *are* recorded (see
+  [Auditing](#auditing)); this residue is not.
 
 ## Using a different authorization server
 
