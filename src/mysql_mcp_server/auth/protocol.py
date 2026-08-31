@@ -48,6 +48,47 @@ class AuthorizationError(Exception):
         self.required = required
 
 
+class VerifierUnavailableError(Exception):
+    """Validation could not be completed — HTTP 503 or 500.
+
+    Not an authentication failure, and the distinction is operational rather
+    than pedantic. When the authorization server is unreachable or the SDK's
+    circuit breaker is open, the token in hand may be perfectly good; nobody
+    can currently say. Reporting that as ``401 invalid_token`` tells a
+    conforming client its credential is bad, so it discards a working token and
+    re-authenticates against the authorization server that is already down —
+    turning an AS outage into a stampede against the AS.
+
+    Two consequences follow from that, and both are enforced by the middleware
+    rather than left to the caller:
+
+    * **No ``WWW-Authenticate`` challenge.** The challenge is what invites a
+      client to go get a new token. RFC 6750 §3 defines it for authentication
+      failures; this is not one.
+    * **No failure-throttle penalty.** Throttling exists to make brute force
+      expensive. Penalising clients for the server's own outage would refuse
+      them service for the whole throttle window *after* the AS recovers.
+
+    ``status`` is 503 when the authorization server is temporarily unable to
+    participate (fetch failures, open circuit) and 500 when the fault is
+    internal to this server or the verifier. ``error`` carries the matching
+    OAuth 2.0 code from RFC 6749 §5.2.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 503,
+        error: str = "temporarily_unavailable",
+        retry_after: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error = error
+        self.retry_after = retry_after
+
+
 class VerifierConfigError(RuntimeError):
     """Auth is switched on but unusable. Raised at startup, never per-request.
 
@@ -128,10 +169,16 @@ class TokenVerifier(Protocol):
         over the method and URI; an implementation that only handles bearer
         tokens may ignore it.
 
-        Raises ``AuthenticationError`` for anything untrustworthy. Must not
-        raise provider-specific exception types: the middleware maps only the
-        two error classes in this module, and anything else is treated as an
-        unexpected failure and reported as a bare 401.
+        Raises ``AuthenticationError`` for anything untrustworthy,
+        ``AuthorizationError`` for a valid token lacking scope, and
+        ``VerifierUnavailableError`` when validation could not be *attempted* —
+        the authorization server being unreachable is not the same answer as
+        the token being bad, and collapsing the two makes an outage look like a
+        credential problem to every client at once.
+
+        Must not raise provider-specific exception types: the middleware maps
+        only the three error classes in this module, and anything else is
+        treated as an internal fault (500).
         """
         ...
 

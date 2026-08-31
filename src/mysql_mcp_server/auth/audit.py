@@ -51,6 +51,11 @@ EVENT_DENIED_SESSION = "session_subject_mismatch"
 EVENT_AUTH_FAILED = "authentication_failed"
 EVENT_STREAM_OPENED = "stream_opened"
 EVENT_THROTTLED = "authentication_throttled"
+# Distinct from EVENT_AUTH_FAILED on purpose: this is the server failing, not
+# the caller. Sharing one event would make an authorization-server outage
+# indistinguishable from a burst of bad tokens in the trail -- which is the
+# exact confusion that made the outage hard to diagnose in the first place.
+EVENT_UNAVAILABLE = "verification_unavailable"
 
 
 def to_file(path: str) -> None:

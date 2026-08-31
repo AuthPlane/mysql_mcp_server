@@ -20,6 +20,7 @@ from .protocol import (
     Identity,
     TokenVerifier,
     VerifierConfigError,
+    VerifierUnavailableError,
 )
 from .settings import AuthSettings
 
@@ -34,6 +35,7 @@ __all__ = [
     "Identity",
     "TokenVerifier",
     "VerifierConfigError",
+    "VerifierUnavailableError",
     "build_verifier",
 ]
 

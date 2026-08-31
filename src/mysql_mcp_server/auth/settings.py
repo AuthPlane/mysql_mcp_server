@@ -79,9 +79,18 @@ class AuthSettings:
     throttle_window_seconds: float = 60.0
     dpop: str = "off"
     allowed_algorithms: tuple[str, ...] = ("ES256", "RS256")
+    # Algorithms a DPoP *proof* may be signed with. Defaults to
+    # allowed_algorithms; see from_env() on why they are separable.
+    dpop_algorithms: tuple[str, ...] = ()
     clock_skew_seconds: int = 30
     dev_mode: bool = False
     realm: str = "mysql_mcp_server"
+    # ``Retry-After`` on a 503 raised because the authorization server could not
+    # be reached. A hint, not a promise: it exists so a client that respects it
+    # backs off instead of retrying in a tight loop against an AS that is
+    # already struggling. Deliberately short -- an AS restart is usually
+    # seconds, and the SDK's circuit breaker will answer instantly meanwhile.
+    unavailable_retry_after: int = 5
 
     def __post_init__(self) -> None:
         """Canonicalise the resource URI on *every* construction path.
@@ -94,6 +103,17 @@ class AuthSettings:
         is exactly the kind of mismatch this whole fix exists to prevent.
         """
         object.__setattr__(self, "resource", canonical_resource(self.resource))
+
+    @property
+    def effective_dpop_algorithms(self) -> tuple[str, ...]:
+        """Proof algorithms, falling back to the token algorithms.
+
+        A property rather than a default in ``from_env`` alone, for the same
+        reason ``__post_init__`` canonicalises the resource: settings built by
+        hand -- tests, an embedding application -- must not disagree with
+        settings built from the environment about what the effective value is.
+        """
+        return self.dpop_algorithms or self.allowed_algorithms
 
     @classmethod
     def from_env(cls) -> "AuthSettings":
@@ -160,6 +180,27 @@ class AuthSettings:
         if any(a.lower() == "none" for a in algorithms):
             # 'alg: none' means unsigned: anyone can mint a token for any subject.
             raise VerifierConfigError("Algorithm 'none' is never acceptable for access tokens.")
+
+        # Proof algorithms are configured separately from token algorithms, and
+        # default to them. The two lists constrain different parties: the token
+        # list says what the *authorization server* may sign with, the proof list
+        # what a *client* may sign with. One variable for both meant proofs could
+        # not be restricted to ES256 while RS256-signed tokens stayed acceptable
+        # -- a reasonable posture, since the AS's algorithm is a deployment fact
+        # and the client's is a policy choice.
+        proof_env = os.getenv("MCP_AUTH_DPOP_ALGORITHMS", "").strip()
+        if proof_env:
+            proof_algorithms = tuple(a.strip() for a in proof_env.split(",") if a.strip())
+            if not proof_algorithms:
+                raise VerifierConfigError(
+                    "MCP_AUTH_DPOP_ALGORITHMS resolved to an empty list."
+                )
+            if any(a.lower() == "none" for a in proof_algorithms):
+                raise VerifierConfigError(
+                    "Algorithm 'none' is never acceptable for DPoP proofs."
+                )
+        else:
+            proof_algorithms = algorithms
 
         try:
             skew = int(os.getenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "30"))
@@ -270,6 +311,7 @@ class AuthSettings:
             enforce_scopes=_flag("MCP_AUTH_ENFORCE_SCOPES", True),
             bind_session_to_subject=_flag("MCP_AUTH_BIND_SESSION", True),
             allowed_algorithms=algorithms,
+            dpop_algorithms=proof_algorithms,
             clock_skew_seconds=skew,
             dev_mode=dev_mode,
             realm=os.getenv("AUTHPLANE_REALM", "mysql_mcp_server").strip() or "mysql_mcp_server",

@@ -24,12 +24,14 @@ from mysql_mcp_server.auth.middleware import (
     SessionBinding,
     bearer_token,
     is_protected,
+    prm_path_for,
 )
 from mysql_mcp_server.auth.protocol import (
     AuthenticationError,
     AuthorizationError,
     Identity,
     TokenVerifier,
+    VerifierUnavailableError,
 )
 
 RESOURCE = "http://testserver"
@@ -320,12 +322,235 @@ def test_unexpected_verifier_error_fails_closed_without_leaking():
     """An exception the verifier never promised must not fail open.
 
     Nor may it echo internals: `verifier exploded` is for the log, not the wire.
+
+    Reported as 500, not 401: an exception outside the taxonomy is a bug here or
+    in the verifier, and says nothing about the caller's token. Telling the
+    caller its credential is bad would send it to re-authenticate for a fault it
+    cannot fix.
     """
     client, _ = build_app()
     response = client.get("/sse", headers={"Authorization": "Bearer boom"})
-    assert response.status_code == 401
+    assert response.status_code == 500
+    assert response.json()["error"] == "server_error"
     assert "exploded" not in response.text
     assert "Traceback" not in response.text
+    # No challenge: nothing is being asserted about the credential.
+    assert "www-authenticate" not in {k.lower() for k in response.headers}
+
+
+# --------------------------------------------------------------------------
+# Discovery must be served at the path the challenge names.
+#
+# RFC 9728 §3 forms the well-known URL by inserting the segment between host and
+# the resource's own path, so a resource with a path moves the document. The
+# route used to be registered at a fixed constant while the challenge came from
+# the SDK's suffix-aware `prm_url()`: with a path-bearing resource the 401 named
+# a URL nothing served, and discovery failed with nothing in the log.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "metadata_url,expected",
+    [
+        # Root resource: unchanged, which is why this was invisible.
+        ("http://testserver/.well-known/oauth-protected-resource", PRM_PATH),
+        # Path-bearing resource: the path becomes a suffix.
+        (
+            "https://mcp.example.com/.well-known/oauth-protected-resource/mysql",
+            "/.well-known/oauth-protected-resource/mysql",
+        ),
+        (
+            "https://mcp.example.com/.well-known/oauth-protected-resource/v2/mysql",
+            "/.well-known/oauth-protected-resource/v2/mysql",
+        ),
+        # Degenerate input falls back rather than producing an empty route path.
+        ("", PRM_PATH),
+    ],
+)
+def test_prm_route_path_follows_the_resource(metadata_url, expected):
+    assert prm_path_for(metadata_url) == expected
+
+
+class PathResourceVerifier(FakeVerifier):
+    """A resource mounted under a path, as `AUTHPLANE_RESOURCE=.../mysql`."""
+
+    RESOURCE = "https://mcp.example.com/mysql"
+    METADATA = "https://mcp.example.com/.well-known/oauth-protected-resource/mysql"
+
+    def protected_resource_metadata(self) -> dict:
+        return {"resource": self.RESOURCE, "authorization_servers": ["http://as.invalid"]}
+
+    def metadata_url(self) -> str:
+        return self.METADATA
+
+
+def test_a_path_bearing_resource_keeps_its_discovery_route_public():
+    """The deadlock this prevents: gating discovery makes the handshake
+    unsatisfiable, because a client cannot get a token without reading it."""
+    client, _ = build_app(verifier=PathResourceVerifier())
+
+    suffixed = "/.well-known/oauth-protected-resource/mysql"
+    assert is_protected(suffixed, client.app.public_paths) is False
+    # The exemption follows the resource: it is the suffixed path that is
+    # explicitly public now, not the root form. (Neither matches a protected
+    # prefix, so `is_protected` answers False for both -- the list is what the
+    # server registers a route at, and what a future prefix change would key on.)
+    assert suffixed in client.app.public_paths
+    assert PRM_PATH not in client.app.public_paths
+
+
+def test_the_challenge_names_the_path_the_route_is_served_at():
+    """The two halves must agree; they came from different sources before."""
+    client, _ = build_app(verifier=PathResourceVerifier())
+    response = client.get("/sse")
+
+    assert response.status_code == 401
+    challenge = response.headers["www-authenticate"]
+    assert f'resource_metadata="{PathResourceVerifier.METADATA}"' in challenge
+    # The advertised URL's path is exactly what the middleware treats as public.
+    assert prm_path_for(PathResourceVerifier.METADATA) in client.app.public_paths
+
+
+# --------------------------------------------------------------------------
+# DPoP `htu` is signed over the on-wire path.
+# --------------------------------------------------------------------------
+
+def test_htu_uses_the_percent_encoded_path():
+    """ASGI decodes `scope["path"]`; the client signed the raw target.
+
+    A path containing `%2F` reconstructed as `/` produces a different `htu` than
+    the client signed, so a valid proof fails -- and passes against the
+    TypeScript sibling, which builds `htu` from the raw request URL.
+    """
+    client, _ = build_app()
+    middleware = client.app
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/messages/a/b",          # decoded by ASGI
+        "raw_path": b"/messages/a%2Fb",   # what actually arrived
+        "headers": [],
+    }
+    assert middleware._request_context(scope).url.endswith("/messages/a%2Fb")
+
+
+def test_htu_excludes_the_query_string():
+    """RFC 9449 §4.2 defines `htu` without query -- and `/messages/` carries a
+    per-session id that would otherwise change the URL on every request."""
+    client, _ = build_app()
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/messages/",
+        "raw_path": b"/messages/?session_id=abc123",
+        "headers": [],
+    }
+    url = client.app._request_context(scope).url
+    assert url.endswith("/messages/")
+    assert "session_id" not in url
+
+
+def test_htu_falls_back_when_the_server_omits_raw_path():
+    """`raw_path` is optional in the ASGI spec."""
+    client, _ = build_app()
+    scope = {"type": "http", "method": "GET", "path": "/sse", "headers": []}
+    assert client.app._request_context(scope).url.endswith("/sse")
+
+
+# --------------------------------------------------------------------------
+# An authorization-server outage is not a bad token.
+#
+# Collapsing 503 into 401 is what turns an AS outage into a stampede: every
+# client is told its credential is bad, so every client discards a working token
+# and re-authenticates against the server that is already down -- and, with the
+# failure throttle on, gets locked out here for doing so.
+# --------------------------------------------------------------------------
+
+class UnavailableVerifier(FakeVerifier):
+    """Stands in for the SDK raising JWKSFetchError / CircuitOpenError."""
+
+    def __init__(self, status: int = 503) -> None:
+        super().__init__()
+        self._status = status
+
+    async def verify(self, token: str, request=None) -> Identity:
+        self.calls.append(token)
+        raise VerifierUnavailableError(
+            "JWKS fetch failed for https://as.internal/.well-known/jwks.json",
+            status=self._status,
+            error="temporarily_unavailable" if self._status == 503 else "server_error",
+            retry_after=5 if self._status == 503 else 0,
+        )
+
+
+def test_as_outage_is_503_not_401():
+    client, _ = build_app(verifier=UnavailableVerifier(503))
+    response = client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "temporarily_unavailable"
+    # The description must steer the client away from throwing its token away.
+    assert "do not discard" in response.json()["error_description"].lower()
+
+
+def test_as_outage_sends_no_challenge_and_a_retry_after():
+    """The challenge is the invitation to re-authenticate. Do not extend it."""
+    client, _ = build_app(verifier=UnavailableVerifier(503))
+    response = client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+
+    header_names = {k.lower() for k in response.headers}
+    assert "www-authenticate" not in header_names
+    assert response.headers["retry-after"] == "5"
+
+
+def test_as_outage_never_leaks_the_internal_url():
+    """The SDK's message names the JWKS endpoint. That is for the log."""
+    client, _ = build_app(verifier=UnavailableVerifier(503))
+    response = client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+
+    assert "as.internal" not in response.text
+    assert "jwks" not in response.text.lower()
+
+
+def test_as_outage_does_not_count_against_the_failure_throttle():
+    """The load-bearing half of the fix.
+
+    Without this, an AS outage refuses the client *twice*: once for the outage,
+    then for the whole throttle window after the AS recovers -- because the
+    client did exactly what the 401 told it to do.
+    """
+    from mysql_mcp_server.auth.throttle import FailureThrottle
+
+    throttle = FailureThrottle(max_failures=2, window_seconds=60.0)
+    client, _ = build_app(verifier=UnavailableVerifier(503), throttle=throttle)
+
+    for _ in range(5):
+        response = client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+        # Still 503 on every attempt -- never 429.
+        assert response.status_code == 503
+
+
+def test_internal_verifier_fault_is_500():
+    client, _ = build_app(verifier=UnavailableVerifier(500))
+    response = client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+
+    assert response.status_code == 500
+    assert response.json()["error"] == "server_error"
+    assert "www-authenticate" not in {k.lower() for k in response.headers}
+
+
+def test_a_genuinely_bad_token_is_still_401_with_a_challenge():
+    """The regression guard for the change above: 401 must keep working.
+
+    An expired token *is* something the client can fix by re-authenticating, so
+    it keeps both the status and the challenge that tell it to.
+    """
+    client, _ = build_app()
+    response = client.get("/sse", headers={"Authorization": "Bearer expired"})
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_token"
+    assert "www-authenticate" in {k.lower() for k in response.headers}
 
 
 def test_no_traceback_in_any_rejection_body():
@@ -583,6 +808,13 @@ def test_session_is_bound_to_the_subject_that_opened_it():
     stream = client.get("/sse", headers={"Authorization": f"Bearer {ALICE_READ}"})
     assert stream.status_code == 200
     assert "session_id=abc123" in stream.text
+
+    # This fixture's `/sse` returns a completed response rather than holding a
+    # stream open, so the middleware has already seen the stream end and released
+    # the binding -- correctly, and the same thing it does when a real stream
+    # closes. Re-seeded here because the subject of this test is the POST-side
+    # check, not the binding's lifetime.
+    client.app.sessions.remember("abc123", "alice")
 
     own = client.post(
         "/messages/?session_id=abc123",

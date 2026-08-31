@@ -16,6 +16,7 @@ from .protocol import (
     Identity,
     RequestContext,
     VerifierConfigError,
+    VerifierUnavailableError,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -91,7 +92,11 @@ class AuthplaneVerifier:
             # that cannot produce a proof, which is why it is not the default.
             resource_kwargs["inbound_dpop"] = InboundDPoPOptions(
                 required=settings.dpop == "required",
-                allowed_proof_algorithms=list(settings.allowed_algorithms),
+                # Proof algorithms, not token algorithms. The two constrain
+                # different parties -- what the AS signs tokens with, versus what
+                # a client may sign proofs with -- so they are configured
+                # separately and only default to the same list.
+                allowed_proof_algorithms=list(settings.effective_dpop_algorithms),
                 clock_skew_seconds=settings.clock_skew_seconds,
             )
 
@@ -171,7 +176,30 @@ class AuthplaneVerifier:
             return frozenset()
 
     def _translate(self, exc: Exception) -> Exception:
-        """Map an SDK exception onto AuthenticationError / AuthorizationError."""
+        """Map an SDK exception onto this package's error taxonomy.
+
+        The SDK's ``http_status()`` distinguishes four outcomes, and all four
+        are carried through rather than collapsed into "bad token":
+
+        =======  ===========================================================
+        403      ``InsufficientScopeError`` -> AuthorizationError
+        401      expired / bad signature / bad claims / revoked / DPoP ->
+                 AuthenticationError. The client can fix this by getting a
+                 new token, which is the only case where saying so is true.
+        503      ``JWKSFetchError``, ``MetadataFetchError``,
+                 ``CircuitOpenError`` -> VerifierUnavailableError. The
+                 authorization server cannot participate in validation right
+                 now; the token may well be fine.
+        500      ``ProtocolError``, ``VerifierRuntimeError`` -> the same, as
+                 an internal fault.
+        =======  ===========================================================
+
+        The 503 case is the one that matters operationally. Reporting an AS
+        outage as ``401 invalid_token`` makes every client discard a working
+        token and re-authenticate against the server that is already down.
+        See ``VerifierUnavailableError`` for why that also skips the challenge
+        and the failure throttle.
+        """
         try:
             from authplane import AuthplaneError, InsufficientScopeError, http_status
 
@@ -181,12 +209,25 @@ class AuthplaneVerifier:
                 status = http_status(exc)
                 if status == 403:
                     return AuthorizationError(str(exc))
+                if status == 503:
+                    return VerifierUnavailableError(
+                        str(exc), status=503, error="temporarily_unavailable",
+                        retry_after=self._settings.unavailable_retry_after,
+                    )
+                if status == 500:
+                    return VerifierUnavailableError(
+                        str(exc), status=500, error="server_error"
+                    )
                 return AuthenticationError(str(exc), error=getattr(exc, "error", "invalid_token"))
         except ImportError:  # pragma: no cover - only if the extra vanished mid-run
             pass
-        # Unknown failure: fail closed, and do not echo the detail to the caller.
+        # An exception the SDK does not define: a bug here or in the verifier,
+        # not a statement about the caller's token. Fail closed as a 500 rather
+        # than blaming the credential, and do not echo the detail to the caller.
         logger.warning("Token verification failed: %s: %s", type(exc).__name__, exc)
-        return AuthenticationError("Token verification failed")
+        return VerifierUnavailableError(
+            "Token verification failed", status=500, error="server_error"
+        )
 
     def protected_resource_metadata(self) -> dict:
         return dict(self._resource.prm_response())

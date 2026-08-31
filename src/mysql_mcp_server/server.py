@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 from .auth import audit as audit_log
 from .auth.current import get_identity as current_identity
+from .auth.current import release_request_identity
 from .sqlguard import DENIAL_MESSAGE, Kind, StatementDenied, classify, is_denial
 
 # Load environment variables from .env file if it exists.
@@ -328,15 +329,55 @@ def verify_readonly_account() -> list[str]:
 # Create the MCP Server instance.
 app = Server("mysql_mcp_server")
 
+
+def require_read_scope(operation: str) -> None:
+    """Refuse ``operation`` unless the caller holds the read scope.
+
+    MCP exposes data through two independent primitives, and both reach the same
+    tables: ``tools/call`` (``read_query`` and friends) and ``resources/read``
+    (``mysql://<table>/data``). Only the first goes through ``call_tool``, so
+    without this the resource primitive is a way to read any table while holding
+    neither ``mysql:read`` nor ``mysql:write`` -- authenticated, but not
+    authorized. Reading a table must cost the same scope whichever door is used.
+
+    ``None`` means authorization does not apply, exactly as in ``call_tool``:
+    stdio has no HTTP layer and therefore no token, and auth may be switched off.
+    Treating that as a denial would make enabling auth the only way to use the
+    server.
+    """
+    identity = current_identity()
+    if identity is None:
+        return
+    required = REQUIRED_SCOPES.get("read_query", ())
+    missing = [s for s in required if not identity.has_scope(s)]
+    if missing:
+        logger.info(
+            "Denied %s for %s: missing scope(s) %s",
+            operation, identity.describe(), ", ".join(missing),
+        )
+        record_denial(
+            audit_log.EVENT_DENIED_SCOPE, identity, operation, {}, "missing read scope"
+        )
+        raise StatementDenied(
+            f"{operation} requires the {' '.join(required)} scope. This token "
+            f"grants: {' '.join(sorted(identity.scopes)) or 'nothing'}."
+        )
+
+
 @app.list_resources()
 async def list_resources() -> list[Resource]:
     """
     Lists available MySQL tables (or databases if no default database is configured) as resources.
     This allows AI agents to discover what data is available.
     """
+    require_read_scope("list_resources")
+
     def _sync_list():
         with maybe_ssh_tunnel() as (host, port):
-            config = get_db_config(host, port)
+            # Read-only account: listing is a read, and it reached the
+            # read-write connection only because these handlers predate the
+            # read/write split and never went through the tool layer.
+            config = get_db_config(host, port, read_only=True)
             try:
                 with connect(**config) as conn:
                     with conn.cursor() as cursor:
@@ -388,9 +429,15 @@ async def read_resource(uri: AnyUrl) -> str:
     """
     Reads the content of a specific table or lists tables within a database based on the provided URI.
     """
+    require_read_scope("read_resource")
+
     def _sync_read():
         with maybe_ssh_tunnel() as (host, port):
-            config = get_db_config(host, port)
+            # Same table, same privileges as `read_query`. Before this, reading
+            # `mysql://orders/data` ran `SELECT * FROM orders LIMIT 100` on the
+            # read-write account while `read_query` ran the same statement on
+            # the SELECT-only one.
+            config = get_db_config(host, port, read_only=True)
             uri_str = str(uri)
             if not uri_str.startswith("mysql://"):
                 raise ValueError(f"Invalid URI scheme: {uri_str}")
@@ -568,6 +615,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """
     # Resolved before the try so the handler below can always reach them, and so
     # a denial is attributed to the right identity even if it is raised deeper in.
+    #
+    # This is the identity of the token on the request that carried *this* call,
+    # not the one that opened the stream -- see `auth/current.py`. The two differ
+    # whenever a client holds several tokens for one subject, which needs no
+    # revocation: asking for a narrower token leaves the wider one alive.
     identity = current_identity()
     denial_event = audit_log.EVENT_DENIED_STATEMENT
 
@@ -669,6 +721,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Return the error as a TextContent so the client can display it.
         # This addresses Issue #50 where errors were not being reported clearly.
         return [TextContent(type="text", text=f"Error calling tool {name}: {str(e)}")]
+    finally:
+        # The call is over, so the per-request identity has no further reader.
+        # Released here rather than when the POST returned, because the POST is
+        # answered before this handler runs.
+        release_request_identity()
 
 @app.list_prompts()
 async def list_prompts() -> list[Prompt]:
@@ -878,11 +935,54 @@ async def main():
     Main entry point for the MCP server.
     Supports both STDIO (default) and SSE (HTTP) transport modes.
     """
+    await _check_read_path()
+
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     if transport == "sse":
         await _run_sse_server()
     else:
         await _run_stdio_server()
+
+
+async def _check_read_path():
+    """Report the read-path posture once, at startup, whatever the transport.
+
+    This lives here and not in ``_run_sse_server`` because it is a property of
+    the *database* configuration, not of the auth configuration. ``MYSQL_RO_USER``
+    is honoured by ``get_db_config(read_only=True)`` unconditionally -- including
+    over stdio, which has no HTTP layer and never reaches the SSE path at all.
+    Gating the check on ``auth_settings.enabled``, as it was, meant an operator
+    running stdio with a misprovisioned read-only account got the weaker posture
+    with neither the startup check nor the warning.
+
+    The failure is fatal on purpose. A read-only account that can write is not a
+    degraded configuration, it is a false one: every read tool, the
+    ``START TRANSACTION READ ONLY`` fallback and the tool split all claim a
+    guarantee the database is not actually enforcing. Refusing to boot is the
+    only outcome that does not silently publish that claim.
+    """
+    if not has_readonly_credentials():
+        logger.warning(
+            "MYSQL_RO_USER is not set. Read tools fall back to READ ONLY "
+            "transactions plus statement classification, which is weaker: "
+            "set MYSQL_RO_USER/MYSQL_RO_PASSWORD to a SELECT-only account "
+            "so the database enforces the read/write split."
+        )
+        return
+
+    problems = await anyio.to_thread.run_sync(verify_readonly_account)
+    if problems:
+        for problem in problems:
+            logger.error("Read-only account check failed: %s", problem)
+        raise RuntimeError(
+            "MYSQL_RO_USER does not have a read-only privilege set; "
+            "fix the grants or unset MYSQL_RO_USER to fall back to "
+            "READ ONLY transactions."
+        )
+    logger.info(
+        "Read path uses the read-only MySQL account (MYSQL_RO_USER); "
+        "writes are refused by the database itself."
+    )
 
 async def _run_stdio_server():
     """Runs the server using standard input/output streams."""
@@ -980,7 +1080,8 @@ async def _run_sse_server():
         from starlette.middleware import Middleware
         from starlette.responses import JSONResponse
 
-        from .auth import PRM_PATH, AuthMiddleware, build_verifier
+        from .auth import AuthMiddleware, build_verifier
+        from .auth.middleware import prm_path_for
 
         global AUDIT_ENABLED
         AUDIT_ENABLED = auth_settings.audit
@@ -1013,7 +1114,17 @@ async def _run_sse_server():
             cannot obtain a token without first reading where to get one."""
             return JSONResponse(verifier.protected_resource_metadata())
 
-        routes.append(Route(PRM_PATH, endpoint=protected_resource_metadata))
+        # Serve the document at the path the 401 challenge actually names.
+        # RFC 9728 §3 puts a resource's own path *after* the well-known segment,
+        # so a non-root AUTHPLANE_RESOURCE moves this route; hard-coding the root
+        # form made discovery 404 for exactly those deployments.
+        prm_route_path = prm_path_for(verifier.metadata_url())
+        routes.append(Route(prm_route_path, endpoint=protected_resource_metadata))
+        logger.info(
+            "Serving RFC 9728 protected-resource metadata at %s (advertised as %s)",
+            prm_route_path,
+            verifier.metadata_url(),
+        )
         middleware.append(
             Middleware(
                 AuthMiddleware,
@@ -1029,7 +1140,7 @@ async def _run_sse_server():
                 throttle=failure_throttle,
                 resource_url=auth_settings.resource,
                 dpop=auth_settings.dpop,
-                dpop_algorithms=auth_settings.allowed_algorithms,
+                dpop_algorithms=auth_settings.effective_dpop_algorithms,
             )
         )
 
@@ -1053,31 +1164,6 @@ async def _run_sse_server():
                 "Audit records enabled on logger 'mysql_mcp_server.audit' (one JSON "
                 "object per line). Each authorized tool call records sub, client_id, "
                 "jti, tool and statement -- identity a reverse proxy cannot provide."
-            )
-
-        # Report the read-path posture once, at startup. An operator who thinks
-        # they are running split read/write privileges but is not should learn
-        # it here rather than from an incident.
-        if has_readonly_credentials():
-            problems = await anyio.to_thread.run_sync(verify_readonly_account)
-            if problems:
-                for problem in problems:
-                    logger.error("Read-only account check failed: %s", problem)
-                raise RuntimeError(
-                    "MYSQL_RO_USER does not have a read-only privilege set; "
-                    "fix the grants or unset MYSQL_RO_USER to fall back to "
-                    "READ ONLY transactions."
-                )
-            logger.info(
-                "Read path uses the read-only MySQL account (MYSQL_RO_USER); "
-                "writes are refused by the database itself."
-            )
-        else:
-            logger.warning(
-                "MYSQL_RO_USER is not set. Read tools fall back to READ ONLY "
-                "transactions plus statement classification, which is weaker: "
-                "set MYSQL_RO_USER/MYSQL_RO_PASSWORD to a SELECT-only account "
-                "so the database enforces the read/write split."
             )
 
     # Define the Starlette application with SSE routes and a health check.

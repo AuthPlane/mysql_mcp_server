@@ -36,17 +36,51 @@ from .protocol import (
     Identity,
     RequestContext,
     TokenVerifier,
+    VerifierUnavailableError,
 )
 from .throttle import FailureThrottle
 
 logger = logging.getLogger(__name__)
 
+# The well-known path for a resource whose URI has no path component. Correct
+# for every deployment at the server root, and the default when no resource URI
+# is known -- but it is *not* the path in general. RFC 9728 §3 forms the URL by
+# inserting the well-known segment between the host and the resource's path, so
+# a resource of `https://host/mysql` is discovered at
+# `/.well-known/oauth-protected-resource/mysql`.
+#
+# Kept as a module constant because the tests and the SSE server both reference
+# the root form, but anything that must be right for a path-bearing resource
+# derives the value from the verifier instead. See `prm_path_for()`.
 PRM_PATH = "/.well-known/oauth-protected-resource"
+
+
+def prm_path_for(metadata_url: str) -> str:
+    """The route path serving the PRM document advertised by ``metadata_url``.
+
+    Derived from the verifier's own `metadata_url()` rather than assumed,
+    because that URL is what a 401 sends clients to. Registering the route at a
+    fixed `PRM_PATH` while the challenge pointed at the RFC 9728 §3 suffix form
+    meant that with `AUTHPLANE_RESOURCE=https://host/mysql` the challenge named
+    `/.well-known/oauth-protected-resource/mysql`, which no route served:
+    discovery 404'd with nothing in the log to explain it. Invisible at the root,
+    which is every deployment we had run.
+    """
+    from urllib.parse import urlsplit
+
+    path = urlsplit(metadata_url).path
+    return path or PRM_PATH
+
 
 # Reachable without a token, and both for a reason.
 #   "/"  container orchestrators probe it before any credential exists.
 #   PRM  a client cannot obtain a token without first discovering where to get
 #        one; gating the discovery document deadlocks the handshake.
+#
+# The PRM entry is per-instance rather than a constant, because the path depends
+# on the resource URI. A middleware that kept the root form here while the server
+# registered the suffix form would authenticate the discovery route -- the same
+# deadlock, arrived at from the other side.
 PUBLIC_PATHS = ("/", PRM_PATH)
 
 # Paths carrying MCP traffic. Both, per fact 1 above.
@@ -62,18 +96,21 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 MAX_TRACKED_SESSIONS = 4096
 
 
-def is_protected(path: str) -> bool:
+def is_protected(path: str, public_paths: Iterable[str] = PUBLIC_PATHS) -> bool:
     """Whether ``path`` requires a token.
+
+    ``public_paths`` is a parameter because the PRM route moves with the
+    resource URI; the default is the root form.
 
     Prefix matching is sound here because Starlette routes on the exact path
     with no dot-segment normalisation: ``/foo/../sse`` does not reach the
     ``/sse`` handler, it 404s. Middleware and router therefore see the same
     string, and there is no path that this function skips but the router
-    resolves to a protected endpoint. ``tests/test_auth.py`` pins that
-    invariant with raw sockets, because it is an assumption about Starlette's
-    behaviour rather than about this code.
+    resolves to a protected endpoint. ``tests/test_path_normalisation.py`` pins
+    that invariant with raw sockets, because it is an assumption about
+    Starlette's behaviour rather than about this code.
     """
-    if path in PUBLIC_PATHS:
+    if path in tuple(public_paths):
         return False
     return any(path == p.rstrip("/") or path.startswith(p) for p in PROTECTED_PREFIXES)
 
@@ -232,6 +269,9 @@ class AuthMiddleware:
         self.throttle = throttle
         self.sessions = SessionBinding()
         self._metadata_url = verifier.metadata_url()
+        # Derived, not assumed: the discovery route has to be public at whatever
+        # path the challenge actually names, or a client cannot bootstrap.
+        self.public_paths = ("/", prm_path_for(self._metadata_url))
 
     def _audit(self, event: str, scope: Mapping[str, Any], **fields: Any) -> None:
         if self.audit:
@@ -252,6 +292,16 @@ class AuthMiddleware:
         The query string is excluded because RFC 9449 §4.2 defines ``htu`` without
         query or fragment — which is fortunate here, since ``/messages/`` carries a
         per-session id that would otherwise change the URL on every request.
+
+        The path comes from ``scope["raw_path"]``, not ``scope["path"]``. ASGI
+        populates the latter percent-*decoded*, while the client signs ``htu``
+        over the on-wire target: a path containing ``%2F`` would be reconstructed
+        here as ``/`` and the proof would fail to match, while verifying fine
+        against the TypeScript sibling. The Authplane SDK's own adapter reads
+        ``raw_path`` for this reason (``authplane/_dpop_adapter.py``); that
+        adapter is Starlette-``Request``-shaped and unusable from raw ASGI, so
+        the rule is reproduced rather than imported. Latent while the only paths
+        are ``/sse`` and ``/messages/``, but wrong is wrong.
         """
         proof = None
         for name, value in scope.get("headers", []):
@@ -263,12 +313,14 @@ class AuthMiddleware:
                 break
         return RequestContext(
             method=scope.get("method", ""),
-            url=f"{self.resource_url}{scope.get('path', '')}",
+            url=f"{self.resource_url}{_raw_path(scope)}",
             proof=proof,
         )
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
-        if scope["type"] != "http" or not is_protected(scope.get("path", "")):
+        if scope["type"] != "http" or not is_protected(
+            scope.get("path", ""), self.public_paths
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -349,16 +401,55 @@ class AuthMiddleware:
             self._audit(audit.EVENT_AUTH_FAILED, scope, outcome="denied", reason=exc.error)
             await self._fail(send, 401, exc.error, _safe_description(exc.error), scope)
             return
-        except Exception as exc:
-            # A verifier that raises something unexpected must still fail
-            # closed, and must not leak internals to an unauthenticated caller.
-            logger.error("Verifier raised %s: %s", type(exc).__name__, exc)
-            if self.throttle is not None:
-                self.throttle.record_failure(throttle_key)
-            self._audit(
-                audit.EVENT_AUTH_FAILED, scope, outcome="denied", reason="verifier error"
+        except VerifierUnavailableError as exc:
+            # Validation could not be *attempted*. The request still fails
+            # closed, but it fails as a server problem, which is what it is.
+            #
+            # Two deliberate omissions, both in the client's interest:
+            #   * no failure recorded against the throttle -- a client that did
+            #     nothing wrong must not be locked out for the duration of the
+            #     window once the authorization server comes back;
+            #   * no WWW-Authenticate challenge -- the challenge is an
+            #     invitation to go get a new token, and a client that accepts it
+            #     discards a working one to re-authenticate against a server
+            #     that is already down.
+            logger.error(
+                "Verification unavailable (%d): %s: %s",
+                exc.status, type(exc).__name__, exc,
             )
-            await self._fail(send, 401, "invalid_token", "Token verification failed", scope)
+            self._audit(
+                audit.EVENT_UNAVAILABLE,
+                scope,
+                outcome="unavailable",
+                reason=exc.error,
+            )
+            await self._fail(
+                send,
+                exc.status,
+                exc.error,
+                _SAFE_DESCRIPTIONS.get(exc.error, "Token verification is unavailable"),
+                scope,
+                challenge=False,
+                retry_after=exc.retry_after,
+            )
+            return
+        except Exception as exc:
+            # A verifier that raises something outside the taxonomy is a bug in
+            # this server or in the verifier, not a statement about the caller's
+            # token. Fail closed, do not leak internals, and do not throttle a
+            # caller for our own fault.
+            logger.error("Verifier raised %s: %s", type(exc).__name__, exc)
+            self._audit(
+                audit.EVENT_UNAVAILABLE, scope, outcome="unavailable", reason="verifier error"
+            )
+            await self._fail(
+                send,
+                500,
+                "server_error",
+                "Token verification failed",
+                scope,
+                challenge=False,
+            )
             return
 
         if self.throttle is not None:
@@ -401,14 +492,16 @@ class AuthMiddleware:
         self, scope: dict, receive: Callable, send: Callable, identity: Identity
     ) -> None:
         seen = False
+        bound_session = ""
 
         async def sniffing_send(message: Mapping[str, Any]) -> None:
-            nonlocal seen
+            nonlocal seen, bound_session
             if not seen and message.get("type") == "http.response.body":
                 body = message.get("body", b"") or b""
                 session_id = _session_id_from_endpoint_event(body)
                 if session_id:
                     seen = True
+                    bound_session = session_id
                     if self.bind_session_to_subject:
                         self.sessions.remember(session_id, identity.subject)
                         logger.debug(
@@ -432,7 +525,18 @@ class AuthMiddleware:
         # observes the session id for the audit record above, and reading one
         # line out of the first body chunk costs nothing on a stream that then
         # runs untouched.
-        await self.app(scope, receive, sniffing_send)
+        try:
+            await self.app(scope, receive, sniffing_send)
+        finally:
+            # Release the binding when the stream ends. Without this the table
+            # only ever grew, so a long-lived deployment drifted towards the
+            # 4,096 cap and then started evicting *live* sessions -- and an
+            # evicted session is no longer subject-checked, which is the one
+            # outcome this table exists to prevent. The transport drops its own
+            # session state at exactly this point (`mcp/server/sse.py`, the
+            # `finally` in `connect_sse`), so the two now have the same lifetime.
+            if bound_session:
+                self.sessions.forget(bound_session)
 
     async def _handle_post(
         self, scope: dict, receive: Callable, send: Callable, identity: Identity
@@ -557,6 +661,23 @@ class AuthMiddleware:
                 outcome="authorized",
             )
 
+        # Publish this request's identity for the tool layer, keyed on the
+        # JSON-RPC id. The handler runs in the *stream's* task and so cannot see
+        # anything set here through a contextvar, but it can see the request id --
+        # which is what makes the scope check read the token that sent the call
+        # rather than the one that opened the stream.
+        #
+        # Registered before the frame is forwarded, and deliberately *not*
+        # cleared when this returns. The POST answers 202 as soon as the
+        # transport accepts the frame, which is strictly before the handler that
+        # needs this entry has run -- clearing it here would make the lookup miss
+        # and silently fall back to the stream owner, i.e. the exact behaviour
+        # this replaces, intermittently. The tool layer clears its own entry when
+        # the call completes; `remember_request` caps the table for the frames
+        # that never reach a handler at all.
+        if call is not None and call.request_id is not None:
+            current.remember_request(call.request_id, identity)
+
         await self.app(scope, _replay_body(body), send)
 
     @staticmethod
@@ -585,6 +706,7 @@ class AuthMiddleware:
         *,
         scope_hint: tuple[str, ...] = (),
         retry_after: int = 0,
+        challenge: bool = True,
     ) -> None:
         common = [
             f'error="{error}"',
@@ -597,16 +719,22 @@ class AuthMiddleware:
         # One challenge per acceptable scheme, as separate header values rather
         # than one comma-joined string: a comma is also the separator *inside* a
         # challenge, so two schemes in one value cannot be parsed unambiguously.
+        # ``challenge=False`` on a 5xx: nothing is being asserted about the
+        # credential, so there is nothing to challenge. RFC 6750 §3 defines the
+        # challenge for authentication failures, and emitting one here is
+        # precisely what sends a client off to discard a working token and
+        # re-authenticate against an authorization server that is already down.
         challenges: list[str] = []
-        if self.dpop != "required":
-            challenges.append(", ".join([f'Bearer realm="{self.realm}"'] + common))
-        if self.dpop != "off":
-            dpop_parts = [f'DPoP realm="{self.realm}"'] + common
-            if self.dpop_algorithms:
-                # RFC 9449 §5.1: tells the client which proof algorithms to sign
-                # with, so it does not have to guess and retry.
-                dpop_parts.append(f'algs="{" ".join(self.dpop_algorithms)}"')
-            challenges.append(", ".join(dpop_parts))
+        if challenge:
+            if self.dpop != "required":
+                challenges.append(", ".join([f'Bearer realm="{self.realm}"'] + common))
+            if self.dpop != "off":
+                dpop_parts = [f'DPoP realm="{self.realm}"'] + common
+                if self.dpop_algorithms:
+                    # RFC 9449 §5.1: tells the client which proof algorithms to
+                    # sign with, so it does not have to guess and retry.
+                    dpop_parts.append(f'algs="{" ".join(self.dpop_algorithms)}"')
+                challenges.append(", ".join(dpop_parts))
 
         logger.info(
             "Rejected %s %s -> %d %s: %s",
@@ -643,6 +771,9 @@ class AuthMiddleware:
 class ToolCall:
     name: str
     query: str
+    # The JSON-RPC id, so the tool layer can find the identity of *this*
+    # request's token rather than the stream owner's. `None` for a notification.
+    request_id: object = None
 
 
 def _tool_call(body: bytes) -> ToolCall | None:
@@ -673,7 +804,7 @@ def _tool_call(body: bytes) -> ToolCall | None:
         candidate = arguments.get("query")
         if isinstance(candidate, str):
             query = candidate
-    return ToolCall(name=name, query=query)
+    return ToolCall(name=name, query=query, request_id=payload.get("id"))
 
 
 # Fixed, caller-safe descriptions per RFC 6750 error code.
@@ -688,6 +819,13 @@ _SAFE_DESCRIPTIONS = {
     "invalid_request": "The request is not a valid bearer-token request",
     "insufficient_scope": "The access token does not carry the scope this operation requires",
     "invalid_client": "The access token was not accepted",
+    # 5xx. Phrased so a client can tell "come back later, your token is fine"
+    # apart from "your token is bad", because the correct reaction differs.
+    "temporarily_unavailable": (
+        "The authorization server is temporarily unreachable, so this token "
+        "could not be validated. Retry; do not discard your token"
+    ),
+    "server_error": "Token validation failed for an internal reason",
 }
 
 
@@ -704,6 +842,22 @@ def _header_safe(text: str) -> str:
     """
     cleaned = "".join(c for c in text if c.isprintable() and c not in '"\\')
     return cleaned[:200]
+
+
+def _raw_path(scope: Mapping[str, Any]) -> str:
+    """The request path as it arrived on the wire, percent-encoding intact.
+
+    ``scope["raw_path"]`` is the ASGI server's copy of the on-wire target and is
+    what a DPoP ``htu`` is signed over. It is optional in the ASGI spec, so the
+    decoded ``scope["path"]`` is the fallback -- identical for any path with
+    nothing to escape, which is every path this server serves today.
+    """
+    raw = scope.get("raw_path")
+    if isinstance(raw, (bytes, bytearray)):
+        # `raw_path` may carry the query string on some servers; `htu` excludes
+        # it (RFC 9449 §4.2), and on this transport it holds the session id.
+        return bytes(raw).partition(b"?")[0].decode("latin-1")
+    return str(scope.get("path", ""))
 
 
 def _query_param(query_string: bytes, key: str) -> str:

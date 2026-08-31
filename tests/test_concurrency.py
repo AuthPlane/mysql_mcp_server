@@ -275,6 +275,16 @@ async def test_concurrent_session_opens_bind_to_the_right_subjects():
             )
         )
 
+        # The bindings are re-seeded because this fixture's `/sse` is not a
+        # stream: it returns a completed response, so the middleware sees the
+        # stream end immediately and releases the binding, as it does in
+        # production when a real stream closes. What this test is about is the
+        # POST-side decision under concurrency, so the state that decision reads
+        # is set up directly. The release itself is covered against a real
+        # long-lived stream in `test_path_normalisation.py`.
+        for i in range(40):
+            app.sessions.remember(f"sess-user{i}", f"user{i}")
+
         # Each subject may use its own session...
         own = await asyncio.gather(
             *(

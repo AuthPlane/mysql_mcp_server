@@ -21,13 +21,12 @@ from starlette.routing import Route
 from mysql_mcp_server.auth import AuthSettings, build_verifier
 from mysql_mcp_server.auth.protocol import VerifierConfigError
 
-# The Authplane SDK requires Python 3.12+ and ships in the optional [auth] extra,
-# so it is absent both on the 3.11 CI leg and on any base install. Tests that
-# exercise the real verifier skip rather than error, which keeps the suite green
-# for contributors who never touch auth.
+# The Authplane SDK ships in the optional [auth] extra, so it is absent on any
+# base install. Tests that exercise the real verifier skip rather than error,
+# which keeps the suite green for contributors who never touch auth.
 _HAS_SDK = importlib.util.find_spec("authplane") is not None
 requires_sdk = pytest.mark.skipif(
-    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk, Python 3.12+)"
+    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk)"
 )
 
 
@@ -356,6 +355,11 @@ async def test_stdio_transport_ignores_auth_configuration(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
     monkeypatch.setenv("AUTHPLANE_ISSUER", "http://127.0.0.1:9")  # would fail if consulted
     monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    # No read-only account configured, so the startup read-path check reports
+    # the posture and returns without touching MySQL. Cleared explicitly rather
+    # than inherited: this test is about transport dispatch, and an ambient
+    # MYSQL_RO_USER would otherwise send it looking for a database.
+    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
 
     ran = []
 
@@ -378,6 +382,7 @@ async def test_unset_transport_defaults_to_stdio(monkeypatch):
     from mysql_mcp_server import server as server_module
 
     monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
     ran = []
 
     async def fake_stdio():
@@ -386,6 +391,88 @@ async def test_unset_transport_defaults_to_stdio(monkeypatch):
     monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
     await server_module.main()
     assert ran == ["stdio"]
+
+
+# --------------------------------------------------------------------------
+# The read-only account check is a property of the database configuration, not
+# of the auth configuration.
+#
+# It used to sit inside `if auth_settings.enabled:` in the SSE path, but
+# `get_db_config(read_only=True)` honours MYSQL_RO_USER unconditionally --
+# including over stdio, which never reaches that path. An operator running stdio
+# with a misprovisioned read-only account got the weaker posture with no check
+# and no warning.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stdio_verifies_the_read_only_account(monkeypatch):
+    """The regression this move exists to prevent."""
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
+
+    checked = []
+    monkeypatch.setattr(
+        server_module, "verify_readonly_account", lambda: checked.append(True) or []
+    )
+
+    async def fake_stdio():
+        return None
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+    await server_module.main()
+
+    assert checked == [True], "stdio must verify the read-only grants too"
+
+
+@pytest.mark.asyncio
+async def test_a_writable_read_only_account_refuses_to_boot_on_stdio(monkeypatch):
+    """Fatal, not a warning.
+
+    A read-only account that can write is not a degraded configuration, it is a
+    false one: the tool split, the read tools and the READ ONLY transaction
+    fallback all claim a guarantee the database is not enforcing.
+    """
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.setattr(
+        server_module,
+        "verify_readonly_account",
+        lambda: ["MYSQL_RO_USER holds INSERT, so the read path is not read-only"],
+    )
+
+    async def fake_stdio():  # pragma: no cover - must not be reached
+        raise AssertionError("server should not have started")
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+
+    with pytest.raises(RuntimeError, match="read-only privilege set"):
+        await server_module.main()
+
+
+@pytest.mark.asyncio
+async def test_no_read_only_account_warns_but_boots(monkeypatch, caplog):
+    """The fallback is weaker, not broken, so it must not be fatal."""
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
+
+    ran = []
+
+    async def fake_stdio():
+        ran.append("stdio")
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+    with caplog.at_level("WARNING"):
+        await server_module.main()
+
+    assert ran == ["stdio"]
+    assert any("MYSQL_RO_USER is not set" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

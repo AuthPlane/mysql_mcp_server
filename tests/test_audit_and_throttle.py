@@ -151,6 +151,10 @@ async def test_statement_denial_and_session_mismatch_are_recorded(audit_records)
             headers={"Authorization": "Bearer ok:alice:mysql:read mysql:write"},
         )
         await client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
+        # See test_auth_middleware.py: this fixture's `/sse` is not long-lived,
+        # so the binding is released as soon as it returns. Re-seeded so the
+        # mismatch this test is about can actually happen.
+        app.sessions.remember("s1", "alice")
         await client.post(
             "/messages/?session_id=s1", json=call(),
             headers={"Authorization": "Bearer ok:bob:mysql:read"},
