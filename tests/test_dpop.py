@@ -39,13 +39,12 @@ from mysql_mcp_server.auth.protocol import (
 
 RESOURCE = "http://testserver"
 
-# The Authplane SDK requires Python 3.12+ and ships in the optional [auth] extra,
-# so it is absent both on the 3.11 CI leg and on any base install. Tests that
-# exercise the real verifier skip rather than error, which keeps the suite green
-# for contributors who never touch auth.
+# The Authplane SDK ships in the optional [auth] extra, so it is absent on any
+# base install. Tests that exercise the real verifier skip rather than error,
+# which keeps the suite green for contributors who never touch auth.
 _HAS_SDK = importlib.util.find_spec("authplane") is not None
 requires_sdk = pytest.mark.skipif(
-    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk, Python 3.12+)"
+    not _HAS_SDK, reason="needs the [auth] extra (authplane-sdk)"
 )
 
 

@@ -30,8 +30,8 @@ sse = [
 ]
 # Opt-in OAuth 2.1 resource-server authentication for the SSE transport.
 # Not installed unless requested: pip install mysql_mcp_server[auth]
-# Requires Python >= 3.12 (the SDK's own floor), so it stays out of the base
-# install, which supports 3.11.
+# The SDK declares requires-python >= 3.11, the same floor as the base install,
+# so this is opt-in for dependency weight rather than for interpreter support.
 auth = [
     "mysql_mcp_server[sse]",
     "authplane-sdk==0.3.0",
