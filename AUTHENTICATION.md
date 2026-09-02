@@ -40,7 +40,7 @@ Install the extra:
 pip install mysql_mcp_server[auth]
 ```
 
-This adds `authplane-sdk==0.3.0` and the SSE dependencies. The version is pinned
+This adds `authplane-sdk==0.4.0` and the SSE dependencies. The version is pinned
 in [`pyproject.toml`](pyproject.toml).
 
 ## Quick start
@@ -446,19 +446,33 @@ MySQL 9.1 Enterprise ships an `authentication_openid_connect` plugin, and
 propagating the subject is not impossible. It is out of scope for four reasons,
 in descending order of how hard they are to work around:
 
-1. The plugin validates **ID tokens**, not OAuth 2.0 access tokens. This server
-   receives an access token; an ID token for the same user would have to be
-   obtained separately. RFC 8693 token exchange is the mechanism, but
-   `authplane-sdk` 0.3.0's `TokenExchangeOptions` has no `requested_token_type`
-   field, so it cannot ask for one today.
+1. **The plugin does not validate `aud`.** Per the reference manual it checks
+   four things: `sub` equals the account's configured user, `iss` equals the
+   configured `identity_provider`, the expiry is in the future, and the
+   signature verifies against the issuer's key. Audience is not among them.
+
+   The manual calls the credential an "Identity token", but that names the JWT
+   in the token file rather than requiring an OIDC ID token: MySQL's own
+   walkthrough obtains one with `az account get-access-token` and uses the
+   `accessToken` field. So an Authplane `at+jwt` would very likely be accepted
+   — and *that is the problem*. With no audience check, any token this issuer
+   minted for that subject authenticates to MySQL, including the `aud=mcp`
+   access token this server is already holding. That is precisely the
+   confused-deputy case the `aud` check on our own plane exists to prevent, and
+   adopting it would mean accepting on the database plane a property we refuse
+   on the MCP one.
 2. It authenticates only. Claims and scopes are **not** mapped to privileges —
    those remain `GRANT`s. So it would move the subject across the boundary
-   without moving the authorization model with it.
+   without moving the authorization model with it: `mysql:read` still could not
+   express "only the `orders` schema".
 3. The server-side plugin is Enterprise Edition only.
 4. It would still need one MySQL account and one pool per subject.
 
-If this is revisited, the shape to reach for is a Broker-backed resource in
-Authplane plus per-subject pooling — not a change to this middleware.
+Reason 1 is not a blocker in the "cannot be built" sense — it is a reason not to
+want it in this shape. If this is revisited, the audience gap has to be closed
+some other way (a dedicated issuer for the database plane, so that a token good
+for MySQL is good for nothing else), alongside a Broker-backed resource in
+Authplane and per-subject pooling. None of that is a change to this middleware.
 
 ### Registering the resource URI
 

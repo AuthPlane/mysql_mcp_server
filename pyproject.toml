@@ -34,7 +34,7 @@ sse = [
 # so this is opt-in for dependency weight rather than for interpreter support.
 auth = [
     "mysql_mcp_server[sse]",
-    "authplane-sdk==0.3.0",
+    "authplane-sdk==0.4.0",
 ]
 
 [[project.authors]]
