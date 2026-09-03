@@ -98,8 +98,16 @@ def build(verifier, **kwargs):
     defaults = {
         "verifier": verifier,
         "realm": "test",
-        "tool_scopes": {"read_query": ("mysql:read",), "write_query": ("mysql:write",), "*": ("mysql:write",)},
-        "read_only_tools": ("read_query",),
+        # Synthetic tool names. These tests target the middleware's scope gate,
+        # which is generic over the map it is given -- the server's own tools are
+        # in `tool_scope_map`, where the only SQL tool has an empty entry because
+        # its connection is the gate. Using real names here would tie a
+        # middleware unit test to that choice.
+        "tool_scopes": {
+            "probe_read": ("mysql:read",),
+            "probe_write": ("mysql:write",),
+            "*": ("mysql:write",),
+        },
         "deny_at_http_layer": True,
     }
     defaults.update(kwargs)
@@ -110,7 +118,7 @@ def client_for(app) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=RESOURCE)
 
 
-def call_body(tool: str = "read_query", query: str = "SELECT 1") -> dict:
+def call_body(tool: str = "probe_read", query: str = "SELECT 1") -> dict:
     return {
         "jsonrpc": "2.0",
         "id": 1,
@@ -194,7 +202,7 @@ async def test_concurrent_scope_checks_do_not_leak_authorization():
             scopes = "mysql:read mysql:write" if privileged else "mysql:read"
             response = await client.post(
                 "/messages/?session_id=unbound",
-                json=call_body("write_query", "DROP TABLE demo"),
+                json=call_body("probe_write", "DROP TABLE demo"),
                 headers={"Authorization": f"Bearer ok:user{i}:{scopes}"},
             )
             return privileged, response.status_code
@@ -426,7 +434,7 @@ async def test_body_replay_is_not_shared_between_concurrent_requests():
 
     async with client_for(app) as client:
         async def one(i: int):
-            payload = call_body("read_query", "SELECT " + ("1," * i) + "1")
+            payload = call_body("probe_read", "SELECT " + ("1," * i) + "1")
             import json as _json
 
             raw = _json.dumps(payload).encode()

@@ -25,6 +25,18 @@ DEFAULT_READ_SCOPE = "mysql:read"
 DEFAULT_WRITE_SCOPE = "mysql:write"
 
 
+def auth_enabled_in_env() -> bool:
+    """Whether MCP_AUTH_MODE asks for authentication, without validating the rest.
+
+    ``AuthSettings.from_env()`` raises on a half-configured auth setup, which is
+    the right behaviour where auth is about to be wired up -- but the startup
+    read-path check only needs the yes/no, and must not turn "auth is off" into
+    an exception for an operator running stdio with a stray AUTHPLANE_* variable
+    exported. Reads the one variable that decides it and nothing else.
+    """
+    return os.getenv("MCP_AUTH_MODE", "none").strip().lower() not in _OFF_VALUES
+
+
 def canonical_resource(raw: str) -> str:
     """Normalise trailing-slash form without breaking the root path.
 

@@ -226,7 +226,6 @@ class AuthMiddleware:
         verifier: TokenVerifier,
         realm: str = "mysql_mcp_server",
         tool_scopes: Mapping[str, tuple[str, ...]] | None = None,
-        read_only_tools: Iterable[str] = (),
         enforce_scopes: bool = True,
         bind_session_to_subject: bool = True,
         audit: bool = True,
@@ -256,7 +255,6 @@ class AuthMiddleware:
             except Exception:  # pragma: no cover - defensive
                 self.resource_url = ""
         self.tool_scopes = dict(tool_scopes or {})
-        self.read_only_tools = frozenset(read_only_tools)
         self.enforce_scopes = enforce_scopes
         # Whether a scope or statement refusal is answered as an HTTP status here.
         # Off by default: a conforming MCP client ignores the POST's status and
@@ -613,40 +611,6 @@ class AuthMiddleware:
                 )
                 return
 
-        # Refuse a write sent to a read-only tool here, while there is still an
-        # HTTP response to put a status on. Once the transport answers 202 the
-        # tool executes in the *stream's* task, and a refusal can only come back
-        # as a JSON-RPC error — correct, but harder for a caller to act on.
-        #
-        # The same check also runs inside the tool, and must: the stdio
-        # transport has no HTTP layer, so this middleware never sees it.
-        if (
-            call is not None
-            and self.read_only_tools
-            and self.deny_at_http_layer
-            and call.name in self.read_only_tools
-        ):
-            refusal = self._classify_refusal(call.query)
-            if refusal is not None:
-                logger.info(
-                    "Denied %s: %s called with a non-read statement: %s",
-                    identity.describe(),
-                    call.name,
-                    refusal,
-                )
-                self._audit(
-                    audit.EVENT_DENIED_STATEMENT,
-                    scope,
-                    identity=identity,
-                    tool=call.name,
-                    statement=call.query,
-                    session_id=session_id,
-                    outcome="denied",
-                    reason=refusal,
-                )
-                await self._fail(send, 403, "invalid_request", refusal, scope)
-                return
-
         if call is not None:
             # The auditable event: this subject was permitted to run this
             # statement through this tool. See audit.py on why the *outcome* is
@@ -679,22 +643,6 @@ class AuthMiddleware:
             current.remember_request(call.request_id, identity)
 
         await self.app(scope, _replay_body(body), send)
-
-    @staticmethod
-    def _classify_refusal(query: str) -> str | None:
-        """Reason to refuse ``query`` on a read-only tool, or None to allow.
-
-        Imported lazily so this module keeps depending on nothing but the
-        verifier seam and the standard library.
-        """
-        if not query:
-            return None
-        from ..sqlguard import Kind, classify
-
-        verdict = classify(query, read_only=True)
-        if verdict.kind is Kind.WRITE or verdict.refusal:
-            return verdict.refusal or "This tool accepts read-only statements"
-        return None
 
     async def _fail(
         self,

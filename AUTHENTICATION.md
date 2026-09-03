@@ -50,7 +50,7 @@ export MCP_TRANSPORT=sse
 export MCP_AUTH_MODE=authplane
 export AUTHPLANE_ISSUER=https://auth.example.com    # your Authplane server
 export AUTHPLANE_RESOURCE=https://mcp.example.com   # this server's canonical URI
-export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...   # see Read/write separation
+export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...   # required: a SELECT-only account
 python -m mysql_mcp_server
 ```
 
@@ -220,21 +220,81 @@ message naming the variable and the fix.
 
 | Tool | Scope required |
 |---|---|
-| `read_query` | `MYSQL_SCOPE_READ` |
 | `get_schema_info` | `MYSQL_SCOPE_READ` |
 | `get_table_sample` | `MYSQL_SCOPE_READ` |
-| `write_query` | `MYSQL_SCOPE_WRITE` |
-| `execute_sql` (deprecated) | `MYSQL_SCOPE_WRITE` |
+| `execute_sql` | either — the scope held selects the connection (see below) |
 | `resources/list`, `resources/read` | `MYSQL_SCOPE_READ` |
 
 A tool name absent from the map falls back to the write scope, so a tool added
 later fails closed rather than shipping unprotected.
 
+### `execute_sql` is authorized by connection, not by a scope gate
+
+The schema tools have a fixed scope requirement. `execute_sql` accepts arbitrary
+SQL, so instead the caller's scope picks **which MySQL account runs the
+statement**:
+
+| Token holds | Connection | Effect |
+|---|---|---|
+| `MYSQL_SCOPE_WRITE` | read-write account | Anything that account is granted |
+| `MYSQL_SCOPE_READ` only | `SELECT`-only account | MySQL refuses anything that writes |
+| `MYSQL_SCOPE_READ` only, no `MYSQL_RO_USER` | read-write account | **Not enforced** — warned at startup, audited per call |
+| neither | — | Refused before the database is reached |
+| no identity (stdio, auth off) | read-write account | Unchanged from before this feature |
+
+This is the reason the tool is not deprecated, and the reason it is now the only
+SQL tool. The earlier design had one connection, so the only safe reading of
+"arbitrary SQL" was "treat every call as a write" — and a tool that cannot be
+authorized precisely is one you take away. With the account doing the enforcing,
+precision comes from MySQL's grants rather than from this process understanding
+the statement, which also retired the `read_query`/`write_query` pair that stood
+in for it: their scope gate proved nothing the connection was not already
+proving.
+
+The third row is the one deliberate fail-open. Failing closed would refuse every
+read-scoped token until an operator provisions a database account, which breaks
+deployments that upgrade before doing so. What it costs is that the read scope is
+a label with nothing behind it until the account exists — so it is warned about
+at startup, warned once when it first happens, and recorded per call as
+`read_scope_not_enforced` with `outcome: allowed`. That event exists because
+`tool_call_authorized` alone would read as "a read happened" for a statement that
+ran with privileges to drop the database.
+
+A refusal arrives as a MySQL error (`1142 ER_TABLEACCESS_DENIED_ERROR`, `1792
+ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION`, and the rest of `DENIAL_ERRNOS` in
+`sqlguard.py`), which is mapped to a tool error with `isError: true` and a fixed
+message. The account name and host in MySQL's own text are not echoed to the
+caller.
+
+**Nothing in this server inspects your SQL.** There was a statement classifier;
+it has been removed, and `MYSQL_RO_USER` does the work instead. The reason is
+measured rather than argued — against MySQL 8.4:
+
+| Statement | `START TRANSACTION READ ONLY`, read-write account | `SELECT`-only account |
+|---|---|---|
+| `INSERT` / `UPDATE` / `DELETE` | refused (1792) | refused (1142) |
+| `CREATE` / `DROP` / `ALTER` / `TRUNCATE` / `RENAME` | **executed** | refused (1142) |
+| `SELECT 1; DROP TABLE t` | **executed** | refused (1142) |
+| `SELECT … INTO OUTFILE` | refused (1227) | refused (1227) |
+| `GRANT` | refused (1044) | refused (1044) |
+
+DDL performs an implicit commit, which ends the read-only transaction before the
+statement runs — so `DROP TABLE` went straight through the old fallback, and the
+classifier was carrying that path alone. A hand-written SQL classifier is exactly
+what should not be load-bearing; there is always one more syntax nobody thought
+of. So the account became mandatory and the classifier was deleted.
+
+What a `SELECT`-only grant still permits was checked too: `LOAD_FILE()` returns
+`NULL` without the `FILE` privilege, `INTO OUTFILE` is refused, and
+`SELECT … FOR UPDATE` is refused. `SLEEP()` and `GET_LOCK()` do run — resource
+consumption rather than a privilege violation, bounded by
+`MYSQL_STATEMENT_TIMEOUT_MS` and `MYSQL_MAX_ROWS`.
+
 MCP resources (`mysql://<table>/data`) are a separate primitive from tools: they
 do not pass through the tool dispatcher, so they needed the check wiring
 separately. They cost the read scope and run on the read-only account, because
-they reach exactly the tables `read_query` reaches -- reading a table must cost
-the same whichever door is used.
+they reach exactly the tables a read-scoped `execute_sql` reaches -- reading a
+table must cost the same whichever door is used.
 
 The scope decision reads the token on the request that carried the call, not the
 one that opened the SSE stream. The two differ whenever a client holds more than

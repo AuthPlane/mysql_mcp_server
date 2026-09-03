@@ -21,9 +21,14 @@ from pydantic import AnyUrl
 from dotenv import load_dotenv
 
 from .auth import audit as audit_log
+from .auth import policy
 from .auth.current import get_identity as current_identity
 from .auth.current import release_request_identity
-from .sqlguard import DENIAL_MESSAGE, Kind, StatementDenied, classify, is_denial
+from .auth.settings import auth_enabled_in_env
+from .sqlguard import (
+    CONNECT_DENIED_MESSAGE, StatementDenied, denial_message, is_connect_denial,
+    is_denial,
+)
 
 # Load environment variables from .env file if it exists.
 # This allows for easy local configuration of database and SSH credentials.
@@ -119,11 +124,8 @@ def maybe_ssh_tunnel():
 def has_readonly_credentials() -> bool:
     """Whether a separate read-only MySQL account is configured.
 
-    When it is, the read tools connect as that account and MySQL itself refuses
-    writes, which is the only read-only guarantee that does not depend on this
-    process classifying SQL correctly. Without it, the read path falls back to
-    a READ ONLY transaction plus statement classification — weaker, and the
-    default only for backward compatibility.
+    That account is the read/write boundary -- see ``_check_read_path()`` for
+    what its absence costs and ``sqlguard`` for why nothing here parses SQL.
     """
     return bool(os.getenv("MYSQL_RO_USER"))
 
@@ -133,9 +135,10 @@ def get_db_config(host=None, port=None, read_only: bool = False):
     Constructs the database connection configuration dictionary from environment variables.
     Validates that required credentials (USER and PASSWORD) are present.
 
-    With ``read_only=True`` and MYSQL_RO_USER set, connects as the read-only
-    account instead. Same host, port, and database — only the identity differs,
-    because the privilege set attached to that identity is the control.
+    With ``read_only=True`` connects as the read-only account instead. Same host,
+    port, and database — only the identity differs, because the privilege set
+    attached to that identity *is* the read/write control. Nothing in this
+    process inspects the statement.
     """
     if read_only and has_readonly_credentials():
         user = os.getenv("MYSQL_RO_USER")
@@ -212,9 +215,16 @@ def get_db_config(host=None, port=None, read_only: bool = False):
 
     return config
 
+# Marks the one problem `verify_readonly_account` reports that is not a verdict
+# about the grants: the database could not be reached to ask. Distinguished
+# because the two need different messages -- an operator told "MYSQL_RO_USER does
+# not have a read-only privilege set" will go and inspect grants that are fine.
+UNVERIFIABLE_PREFIX = "could not verify read-only grants"
+
 # Privileges that a read-only account must not hold. Checked at startup rather
 # than trusted, because "the operator provisioned it correctly" is the kind of
 # assumption that is wrong exactly when it matters.
+
 FORBIDDEN_RO_PRIVILEGES = (
     "ALL PRIVILEGES", "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
     "TRUNCATE", "FILE", "GRANT OPTION", "SUPER", "RELOAD", "PROCESS", "SHUTDOWN",
@@ -222,73 +232,11 @@ FORBIDDEN_RO_PRIVILEGES = (
 )
 
 
-# Tools whose `query` argument must classify as read-only. Enforced inside the
-# tool, which is also what covers the stdio transport -- stdio has no HTTP layer,
-# so no middleware ever runs for it.
-READ_ONLY_TOOLS = ("read_query",)
-
-# Scope required per tool, resolved at import so the tool layer can enforce
-# without reaching into auth settings. Populated from the configured scope names
-# at startup; the defaults match the documented ones.
-REQUIRED_SCOPES: dict = {}
-
-# Whether the tool layer writes audit records. Set at startup alongside
-# REQUIRED_SCOPES, for the same reason: the tool layer enforces authorization but
-# has no access to auth settings, and it must not start auditing merely because
-# an identity happens to be present.
-AUDIT_ENABLED = False
-
-
-def record_denial(event: str, identity, tool: str, arguments: dict, reason: str) -> None:
-    """Audit a tool call this layer refused.
-
-    The middleware records ``tool_call_authorized`` once a request clears
-    authentication and the HTTP-layer checks, but the per-tool decisions happen
-    *here* -- and until now a refusal left no audit record at all, only a log
-    line. The trail therefore said "authorized" for calls that were then refused
-    on scope or on statement classification, which is the one direction an audit
-    trail must never err in. Observed three separate times against a real client
-    before this was added.
-
-    No ASGI scope is available in this task, so ``method``, ``path`` and
-    ``client`` are absent from these records rather than guessed. The stream's
-    own request carries them, and it is already audited as ``stream_opened``;
-    the ``session_id`` there is what ties the two together.
-    """
-    if not AUDIT_ENABLED:
-        return
-    statement = ""
-    if isinstance(arguments, dict):
-        candidate = arguments.get("query")
-        if isinstance(candidate, str):
-            statement = candidate
-    audit_log.record(
-        event,
-        {},
-        identity=identity,
-        tool=tool,
-        statement=statement,
-        outcome="denied",
-        reason=reason,
-    )
-
-
-def tool_scope_map(read_scope: str, write_scope: str) -> dict:
-    """Which scope each tool requires.
-
-    ``execute_sql`` demands the write scope because it accepts arbitrary SQL:
-    granting it under the read scope would authorize ``DROP TABLE`` for a
-    read-only caller. The ``"*"`` entry is the fallback for any tool name not
-    listed, so a tool added later is refused rather than exposed unprotected.
-    """
-    return {
-        "read_query": (read_scope,),
-        "get_schema_info": (read_scope,),
-        "get_table_sample": (read_scope,),
-        "write_query": (write_scope,),
-        "execute_sql": (write_scope,),
-        "*": (write_scope,),
-    }
+# Which scope each tool needs, which MySQL account a scope reaches, and the
+# audit records for both, live in `auth/policy.py` -- one subsystem rather than
+# three blocks wedged in between the connection helpers and the tool handlers.
+# `policy.configure()` installs it from the parsed auth settings at startup;
+# until then its maps are empty, which is how "auth is off" is represented.
 
 
 def verify_readonly_account() -> list[str]:
@@ -311,7 +259,7 @@ def verify_readonly_account() -> list[str]:
                     cursor.execute("SHOW GRANTS FOR CURRENT_USER()")
                     grants = [row[0].upper() for row in cursor.fetchall()]
     except Error as exc:
-        return [f"could not verify read-only grants: {getattr(exc, 'msg', None) or exc}"]
+        return [f"{UNVERIFIABLE_PREFIX}: {getattr(exc, 'msg', None) or exc}"]
 
     for grant in grants:
         # Only the privilege list matters, not the object it applies to: a
@@ -333,35 +281,10 @@ app = Server("mysql_mcp_server")
 def require_read_scope(operation: str) -> None:
     """Refuse ``operation`` unless the caller holds the read scope.
 
-    MCP exposes data through two independent primitives, and both reach the same
-    tables: ``tools/call`` (``read_query`` and friends) and ``resources/read``
-    (``mysql://<table>/data``). Only the first goes through ``call_tool``, so
-    without this the resource primitive is a way to read any table while holding
-    neither ``mysql:read`` nor ``mysql:write`` -- authenticated, but not
-    authorized. Reading a table must cost the same scope whichever door is used.
-
-    ``None`` means authorization does not apply, exactly as in ``call_tool``:
-    stdio has no HTTP layer and therefore no token, and auth may be switched off.
-    Treating that as a denial would make enabling auth the only way to use the
-    server.
+    A thin wrapper so the resource handlers do not each have to resolve the
+    identity; the decision itself is ``policy.require_read_scope``.
     """
-    identity = current_identity()
-    if identity is None:
-        return
-    required = REQUIRED_SCOPES.get("read_query", ())
-    missing = [s for s in required if not identity.has_scope(s)]
-    if missing:
-        logger.info(
-            "Denied %s for %s: missing scope(s) %s",
-            operation, identity.describe(), ", ".join(missing),
-        )
-        record_denial(
-            audit_log.EVENT_DENIED_SCOPE, identity, operation, {}, "missing read scope"
-        )
-        raise StatementDenied(
-            f"{operation} requires the {' '.join(required)} scope. This token "
-            f"grants: {' '.join(sorted(identity.scopes)) or 'nothing'}."
-        )
+    policy.require_read_scope(operation, current_identity())
 
 
 @app.list_resources()
@@ -374,9 +297,7 @@ async def list_resources() -> list[Resource]:
 
     def _sync_list():
         with maybe_ssh_tunnel() as (host, port):
-            # Read-only account: listing is a read, and it reached the
-            # read-write connection only because these handlers predate the
-            # read/write split and never went through the tool layer.
+            # Listing is a read, so it uses the read-only account.
             config = get_db_config(host, port, read_only=True)
             try:
                 with connect(**config) as conn:
@@ -433,10 +354,8 @@ async def read_resource(uri: AnyUrl) -> str:
 
     def _sync_read():
         with maybe_ssh_tunnel() as (host, port):
-            # Same table, same privileges as `read_query`. Before this, reading
-            # `mysql://orders/data` ran `SELECT * FROM orders LIMIT 100` on the
-            # read-write account while `read_query` ran the same statement on
-            # the SELECT-only one.
+            # A resource read reaches the same rows as a read-scoped tool
+            # call, so it uses the same account.
             config = get_db_config(host, port, read_only=True)
             uri_str = str(uri)
             if not uri_str.startswith("mysql://"):
@@ -484,60 +403,15 @@ async def list_tools() -> list[Tool]:
     """
     return [
         Tool(
-            name="read_query",
-            description=(
-                "Run a read-only SQL query (SELECT, SHOW, DESCRIBE, EXPLAIN). "
-                "Rejects anything that writes data, changes schema, touches the filesystem, "
-                "or takes locks. Supports cross-database queries using database.table notation. "
-                "Single statements only — use fully qualified names instead of USE statements. "
-                "Prefer this over execute_sql: it cannot modify anything."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "A read-only SQL statement. Single statements only."
-                    }
-                },
-                "required": ["query"]
-            },
-            annotations=ToolAnnotations(
-                title="Read Query",
-                readOnlyHint=True,
-                destructiveHint=False
-            )
-        ),
-        Tool(
-            name="write_query",
-            description=(
-                "Run a SQL statement that modifies data or schema "
-                "(INSERT, UPDATE, DELETE, CREATE, ALTER, DROP). "
-                "Single statements only. Use read_query for anything that only reads."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The SQL statement to execute. Single statements only."
-                    }
-                },
-                "required": ["query"]
-            },
-            annotations=ToolAnnotations(
-                title="Write Query",
-                readOnlyHint=False,
-                destructiveHint=True
-            )
-        ),
-        Tool(
             name="execute_sql",
             description=(
-                "DEPRECATED — use read_query or write_query instead. "
-                "Executes any single SQL statement, read or write, which makes it impossible "
-                "to authorize precisely; it is treated as a write everywhere. "
-                "Kept for backward compatibility with existing configurations."
+                "Execute a SQL statement against the MySQL server. "
+                "Use for SELECT, DML (INSERT/UPDATE/DELETE), SHOW, DESCRIBE, and ad-hoc queries. "
+                "Supports cross-database queries using database.table notation. "
+                "Single statements only — use fully qualified names instead of USE statements. "
+                "The privileges it runs with follow the caller's scope: a read-scoped caller "
+                "reaches the database as a SELECT-only account, so a write is refused by "
+                "MySQL rather than by any inspection of the SQL here."
             ),
             inputSchema={
                 "type": "object",
@@ -550,7 +424,7 @@ async def list_tools() -> list[Tool]:
                 "required": ["query"]
             },
             annotations=ToolAnnotations(
-                title="Execute SQL (deprecated)",
+                title="Execute SQL",
                 readOnlyHint=False,
                 destructiveHint=True
             )
@@ -631,48 +505,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # conforming MCP client ignores the POST's HTTP status and waits on the
         # stream, so an HTTP-only 403 makes it hang. Observed with the official
         # MCP client library.
-        #
-        # No identity means authorization does not apply -- stdio (no HTTP layer,
-        # no token) or auth switched off. It must not mean "denied", or enabling
-        # auth would become the only way to use the server.
-        if identity is not None:
-            required = REQUIRED_SCOPES.get(name, REQUIRED_SCOPES.get("*", ()))
-            missing = [s for s in required if not identity.has_scope(s)]
-            if missing:
-                logger.info(
-                    "Denied %s for %s: missing scope(s) %s",
-                    name, identity.describe(), ", ".join(missing),
-                )
-                denial_event = audit_log.EVENT_DENIED_SCOPE
-                raise StatementDenied(
-                    f"'{name}' requires the {' '.join(required)} scope. This token "
-                    f"grants: {' '.join(sorted(identity.scopes)) or 'nothing'}."
-                )
+        missing = policy.missing_scopes(identity, name)
+        if missing:
+            denial_event = audit_log.EVENT_DENIED_SCOPE
+            raise policy.scope_denial(identity, name, missing)
 
-        if name in ("read_query", "write_query", "execute_sql"):
+        if name == "execute_sql":
             query = arguments.get("query")
             if not query:
                 raise ValueError("Query is required")
-            if name == "read_query":
-                # Classification runs before the generic single-statement check
-                # below, because on the read path a stacked statement is an
-                # attempt to smuggle a write past a read-only tool -- a denial,
-                # not a usability limitation. classify() detects stacking itself.
-                #
-                # This is not the security boundary: the read path also connects
-                # as the read-only account (or opens a READ ONLY transaction), so
-                # a statement that gets past here is still refused by MySQL.
-                #
-                # Over SSE the auth middleware has already run this same check and
-                # answered 403. This copy is what protects the stdio transport,
-                # which has no HTTP layer and therefore no middleware.
-                verdict = classify(query, read_only=True)
-                if verdict.kind is Kind.WRITE or verdict.refusal:
-                    raise StatementDenied(
-                        f"read_query refused this statement: {verdict.refusal or 'it modifies data'}. "
-                        "Use write_query if you intend to modify anything."
-                    )
-                return await run_query(query, read_only=True)
 
             if ";" in query.strip().rstrip(";"):
                 return [TextContent(type="text", text=(
@@ -680,13 +521,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "Instead of USE statements, use fully qualified names: database.table"
                 ))]
 
-            # write_query and the deprecated execute_sql both run on the
-            # read-write connection.
-            if name == "execute_sql":
-                logger.warning(
-                    "execute_sql is deprecated; use read_query for reads and write_query for writes."
-                )
-            return await run_query(query)
+            # The caller's scope picks the connection; the connection's grants
+            # enforce the outcome. That is what lets one tool taking arbitrary
+            # SQL be authorized precisely, with a single mechanism to get right
+            # rather than a scope gate layered over the same door. A refusal from
+            # policy.connection_for is about scope, not the statement; anything
+            # after it is MySQL's verdict.
+            denial_event = audit_log.EVENT_DENIED_SCOPE
+            read_only = policy.connection_for(
+                identity,
+                readonly_available=has_readonly_credentials(),
+                tool=name,
+                statement=query,
+            )
+            denial_event = audit_log.EVENT_DENIED_STATEMENT
+            return await run_query(query, read_only=read_only)
 
         elif name == "get_schema_info":
             table_name = arguments.get("table_name")
@@ -713,7 +562,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # design, for unexpected failures -- would present a refusal as a
         # successful answer.
         logger.info("Denied tool call %s: %s", name, e)
-        record_denial(denial_event, identity, name, arguments, str(e))
+        policy.record_denial(denial_event, identity, name, arguments, str(e))
         raise
     except Exception as e:
         logger.error(f"Error in call_tool: {str(e)}")
@@ -837,13 +686,15 @@ async def run_query(query: str, read_only: bool = False) -> list[TextContent]:
     Uses anyio.to_thread.run_sync to prevent blocking the async event loop.
 
     ``read_only=True`` routes to the read-only MySQL account when one is
-    configured, and otherwise opens a READ ONLY transaction so the server
-    rejects writes that got past classification.
+    configured. A statement that writes is then refused by MySQL and surfaces as
+    a ``StatementDenied`` (see ``sqlguard.DENIAL_ERRNOS``); nothing here parses
+    it. With no such account ``get_db_config`` returns the read-write
+    credentials, and the caller of this function is responsible for having warned
+    about that -- see ``policy.connection_for()``.
     """
     def _sync_run():
         with maybe_ssh_tunnel() as (host, port):
             config = get_db_config(host, port, read_only=read_only)
-            fallback_txn = read_only and not has_readonly_credentials()
             try:
                 with connect(**config) as conn:
                     with conn.cursor() as cursor:
@@ -853,11 +704,6 @@ async def run_query(query: str, read_only: bool = False) -> list[TextContent]:
                                 # Session-scoped, so it cannot leak into another
                                 # connection; each call opens its own.
                                 cursor.execute(f"SET SESSION max_execution_time = {timeout_ms}")
-                            if fallback_txn:
-                                # Second line of defence when a single account
-                                # serves both paths: MySQL raises ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
-                                # on any write attempted inside this transaction.
-                                cursor.execute("START TRANSACTION READ ONLY")
                         cursor.execute(query)
                         query_upper = query.strip().upper()
 
@@ -889,6 +735,19 @@ async def run_query(query: str, read_only: bool = False) -> list[TextContent]:
                                 rows = cursor.fetchmany(max_rows + 1)
                                 truncated = len(rows) > max_rows
                                 rows = rows[:max_rows]
+                                if truncated:
+                                    # The rest of the result set has to be read
+                                    # off the connection even though it is being
+                                    # discarded: mysql-connector raises
+                                    # "Unread result found" when a cursor with
+                                    # pending rows is closed, which turned every
+                                    # capped query into a failure instead of a
+                                    # truncated answer. Drained in batches rather
+                                    # than with fetchall() so the rows this cap
+                                    # exists to avoid materialising are not all
+                                    # held at once.
+                                    while cursor.fetchmany(max_rows):
+                                        pass
                             else:
                                 rows = cursor.fetchall()
                                 truncated = False
@@ -915,16 +774,35 @@ async def run_query(query: str, read_only: bool = False) -> list[TextContent]:
             except Error as e:
                 # Extract and log specific MySQL error messages.
                 error_msg = getattr(e, 'msg', None) or str(e) or 'Unknown MySQL error'
+                if is_connect_denial(e):
+                    # The server's own credentials were rejected. A fault, not a
+                    # refusal -- but MySQL's text names the account and the host
+                    # it dialled from, and the caller can act on neither.
+                    logger.error(
+                        "Could not authenticate to MySQL: %s. Check MYSQL_USER / "
+                        "MYSQL_PASSWORD%s.",
+                        error_msg,
+                        " and MYSQL_RO_USER / MYSQL_RO_PASSWORD" if read_only else "",
+                    )
+                    return [TextContent(type="text", text=CONNECT_DENIED_MESSAGE)]
                 if is_denial(e):
                     # A policy refusal, not a fault: the caller is told it is not
                     # permitted, but not *which* account was refused. MySQL's own
                     # message names the user and host, which is not the caller's
                     # business. Full detail still goes to the server log.
+                    #
+                    # Which message depends on the connection: on the read-only
+                    # one the caller's scope chose the account and can be changed;
+                    # on the read-write one the deployed account simply lacks a
+                    # privilege and mentioning scopes would misdirect.
                     logger.warning(
-                        "Denied by MySQL (errno %s): %s", getattr(e, "errno", "?"), error_msg
+                        "Denied by MySQL (errno %s) on the %s connection: %s",
+                        getattr(e, "errno", "?"),
+                        "read-only" if read_only else "read-write",
+                        error_msg,
                     )
                     # Raised, not returned, so the result carries isError: true.
-                    raise StatementDenied(DENIAL_MESSAGE) from e
+                    raise StatementDenied(denial_message(read_only)) from e
                 logger.error(f"Error executing SQL: {error_msg}")
                 return [TextContent(type="text", text=f"Error executing query: {error_msg}")]
 
@@ -947,37 +825,58 @@ async def main():
 async def _check_read_path():
     """Report the read-path posture once, at startup, whatever the transport.
 
-    This lives here and not in ``_run_sse_server`` because it is a property of
-    the *database* configuration, not of the auth configuration. ``MYSQL_RO_USER``
-    is honoured by ``get_db_config(read_only=True)`` unconditionally -- including
-    over stdio, which has no HTTP layer and never reaches the SSE path at all.
-    Gating the check on ``auth_settings.enabled``, as it was, meant an operator
-    running stdio with a misprovisioned read-only account got the weaker posture
-    with neither the startup check nor the warning.
+    Two failures, two outcomes:
 
-    The failure is fatal on purpose. A read-only account that can write is not a
-    degraded configuration, it is a false one: every read tool, the
-    ``START TRANSACTION READ ONLY`` fallback and the tool split all claim a
-    guarantee the database is not actually enforcing. Refusing to boot is the
-    only outcome that does not silently publish that claim.
+    * **No read-only account.** A warning, and only under auth -- without auth
+      there is no scope and nothing is being claimed, so the original server's
+      behaviour is untouched. Under auth a read-scoped token still works, on the
+      read-write account, so failing closed here would break every deployment
+      that upgrades without provisioning the account first.
+    * **A read-only account that can write.** Fatal, on every transport:
+      ``MYSQL_RO_USER`` is honoured by ``get_db_config(read_only=True)``
+      unconditionally, stdio included, so every read-scoped call claims a
+      guarantee the database is not enforcing. Not a degraded configuration but
+      a false one, and unlike the case above there is nothing to preserve -- the
+      account exists, it just does not do what its name says.
     """
     if not has_readonly_credentials():
-        logger.warning(
-            "MYSQL_RO_USER is not set. Read tools fall back to READ ONLY "
-            "transactions plus statement classification, which is weaker: "
-            "set MYSQL_RO_USER/MYSQL_RO_PASSWORD to a SELECT-only account "
-            "so the database enforces the read/write split."
-        )
+        if auth_enabled_in_env():
+            logger.warning(
+                "MYSQL_RO_USER is not configured, so there is no read-only "
+                "database account and the read scope has nothing enforcing it. "
+                "A token holding only the read scope will run its SQL on the "
+                "read-write account: if you grant read scope expecting that a "
+                "DROP DATABASE cannot happen, that is not currently guaranteed. "
+                "Calls in that state are logged and audited as "
+                "'read_scope_not_enforced'. To close it: CREATE USER "
+                "'mcp_ro'@'%' IDENTIFIED BY '<password>'; GRANT SELECT ON "
+                "<database>.* TO 'mcp_ro'@'%'; then set MYSQL_RO_USER and "
+                "MYSQL_RO_PASSWORD."
+            )
         return
 
     problems = await anyio.to_thread.run_sync(verify_readonly_account)
     if problems:
         for problem in problems:
             logger.error("Read-only account check failed: %s", problem)
+        if any(p.startswith(UNVERIFIABLE_PREFIX) for p in problems):
+            # Still fatal -- an unverified account is a guarantee this server
+            # would be claiming without having checked -- but say what actually
+            # happened. Told "MYSQL_RO_USER does not have a read-only privilege
+            # set", an operator goes and inspects grants that are fine.
+            raise RuntimeError(
+                "Could not verify the read-only account's grants, so whether the "
+                "read scope is enforced is unknown. The database was unreachable "
+                "or refused the connection -- check MYSQL_HOST, MYSQL_PORT and "
+                "the MYSQL_RO_USER credentials. See the error logged above."
+            )
         raise RuntimeError(
-            "MYSQL_RO_USER does not have a read-only privilege set; "
-            "fix the grants or unset MYSQL_RO_USER to fall back to "
-            "READ ONLY transactions."
+            "MYSQL_RO_USER does not have a read-only privilege set, so the read "
+            "scope would be enforced by an account that can write -- which is "
+            "worse than having no read-only account at all, because the "
+            "configuration says otherwise. Fix the grants (GRANT SELECT only), "
+            "or unset MYSQL_RO_USER to run without the split and get the "
+            "startup warning instead."
         )
     logger.info(
         "Read path uses the read-only MySQL account (MYSQL_RO_USER); "
@@ -1083,12 +982,10 @@ async def _run_sse_server():
         from .auth import AuthMiddleware, build_verifier
         from .auth.middleware import prm_path_for
 
-        global AUDIT_ENABLED
-        AUDIT_ENABLED = auth_settings.audit
-
-        REQUIRED_SCOPES.clear()
-        REQUIRED_SCOPES.update(
-            tool_scope_map(auth_settings.read_scope, auth_settings.write_scope)
+        policy.configure(
+            auth_settings.read_scope,
+            auth_settings.write_scope,
+            audit_enabled=auth_settings.audit,
         )
 
         verifier = await build_verifier(auth_settings)
@@ -1130,10 +1027,9 @@ async def _run_sse_server():
                 AuthMiddleware,
                 verifier=verifier,
                 realm=auth_settings.realm,
-                tool_scopes=tool_scope_map(
+                tool_scopes=policy.tool_scope_map(
                     auth_settings.read_scope, auth_settings.write_scope
                 ),
-                read_only_tools=READ_ONLY_TOOLS,
                 enforce_scopes=auth_settings.enforce_scopes,
                 bind_session_to_subject=auth_settings.bind_session_to_subject,
                 audit=auth_settings.audit,

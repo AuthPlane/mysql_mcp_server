@@ -276,3 +276,80 @@ def test_mysql_denial_message_names_the_account_which_is_why_we_replace_it(seede
 
     assert "@" not in DENIAL_MESSAGE
     assert os.getenv("MYSQL_RO_USER", "\0") not in DENIAL_MESSAGE
+
+
+# --------------------------------------------------------------------------
+# Two defects found by running the server rather than by any assertion below.
+# Both needed a live MySQL to surface: the mocked cursors in test_server.py and
+# test_formatting.py cannot reproduce either.
+# --------------------------------------------------------------------------
+
+def test_a_capped_result_set_returns_rows_instead_of_failing():
+    """`MYSQL_MAX_ROWS` was broken for exactly the case it exists for.
+
+    `fetchmany(max_rows + 1)` leaves the rest of the result set on the
+    connection, and mysql-connector raises "Unread result found" when a cursor
+    with pending rows is closed -- so every query that actually hit the cap
+    failed outright instead of returning a truncated answer. Any query under the
+    cap worked, which is why it went unnoticed.
+    """
+    import asyncio
+
+    from mysql_mcp_server.server import run_query
+
+    query = (
+        "SELECT a.ORDINAL_POSITION FROM information_schema.columns a "
+        "CROSS JOIN information_schema.columns b LIMIT 1500"
+    )
+    result = asyncio.run(run_query(query, read_only=True))
+    body = result[0].text
+    assert "Unread result found" not in body, "the cap must not turn into a failure"
+    lines = body.splitlines()
+    assert lines[-1].startswith("-- truncated at MYSQL_MAX_ROWS="), lines[-1]
+    # header + capped rows + the truncation notice
+    assert len(lines) == 1 + 1000 + 1, len(lines)
+
+
+def test_rejected_server_credentials_are_not_reported_as_a_scope_problem():
+    """`1045` reads like the other access-denied errnos and is not one of them.
+
+    MySQL raises it when *credentials* are rejected, at connect time, with
+    nothing to do with the statement. While it sat in `DENIAL_ERRNOS`, a wrong
+    `MYSQL_PASSWORD` reached the caller as "this statement is not permitted ...
+    a token carrying the write scope is required" -- pointing at an
+    authorization problem that does not exist while never mentioning the real
+    one. Its text also names the account and the host, which the caller cannot
+    act on.
+    """
+    import asyncio
+
+    from mysql_mcp_server import server as server_module
+    from mysql_mcp_server.sqlguard import (
+        CONNECT_DENIED_MESSAGE, DENIAL_ERRNOS, is_connect_denial,
+    )
+
+    assert 1045 not in DENIAL_ERRNOS, "1045 is a connection fault, not a refusal"
+
+    class Rejected(Exception):
+        errno = 1045
+        msg = "Access denied for user 'mcp'@'10.0.0.1' (using password: YES)"
+
+    assert is_connect_denial(Rejected())
+
+    real_config = server_module.get_db_config
+
+    def wrong_password(host=None, port=None, read_only=False):
+        config = real_config(host, port, read_only=read_only)
+        config["password"] = "definitely-not-the-password"
+        return config
+
+    server_module.get_db_config = wrong_password
+    try:
+        result = asyncio.run(server_module.run_query("SELECT 1", read_only=True))
+    finally:
+        server_module.get_db_config = real_config
+
+    body = result[0].text
+    assert body == CONNECT_DENIED_MESSAGE
+    assert "@" not in body, "the account and host must not reach the caller"
+    assert "scope" not in body.lower(), "there is no scope that fixes a bad password"

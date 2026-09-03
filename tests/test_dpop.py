@@ -104,7 +104,7 @@ def client_for(app) -> httpx.AsyncClient:
 
 
 CALL = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "read_query", "arguments": {"query": "SELECT 1"}}}
+        "params": {"name": "execute_sql", "arguments": {"query": "SELECT 1"}}}
 
 
 # --------------------------------------------------------------------------

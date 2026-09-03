@@ -359,7 +359,10 @@ async def test_stdio_transport_ignores_auth_configuration(monkeypatch):
     # the posture and returns without touching MySQL. Cleared explicitly rather
     # than inherited: this test is about transport dispatch, and an ambient
     # MYSQL_RO_USER would otherwise send it looking for a database.
-    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
+    # The read-only account is required at startup; this test is about transport
+    # dispatch, so it is configured and the grant check stubbed out.
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.setattr(server_module, "verify_readonly_account", lambda: [])
 
     ran = []
 
@@ -382,7 +385,8 @@ async def test_unset_transport_defaults_to_stdio(monkeypatch):
     from mysql_mcp_server import server as server_module
 
     monkeypatch.delenv("MCP_TRANSPORT", raising=False)
-    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.setattr(server_module, "verify_readonly_account", lambda: [])
     ran = []
 
     async def fake_stdio():
@@ -394,14 +398,18 @@ async def test_unset_transport_defaults_to_stdio(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The read-only account check is a property of the database configuration, not
-# of the auth configuration.
+# The read-path posture check, and why its two halves answer differently.
 #
-# It used to sit inside `if auth_settings.enabled:` in the SSE path, but
+# *Verifying* the account is a property of the database configuration:
 # `get_db_config(read_only=True)` honours MYSQL_RO_USER unconditionally --
-# including over stdio, which never reaches that path. An operator running stdio
-# with a misprovisioned read-only account got the weaker posture with no check
-# and no warning.
+# including over stdio, which never reaches the SSE path -- so an account that
+# can write is fatal on every transport. This check used to sit inside
+# `if auth_settings.enabled:`, and an operator running stdio with a
+# misprovisioned account got the weaker posture with no check and no warning.
+#
+# The account being *absent* is different: there is a working degraded mode, and
+# it only degrades something if scopes exist. So that half is a warning, and only
+# under auth.
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -455,24 +463,94 @@ async def test_a_writable_read_only_account_refuses_to_boot_on_stdio(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_no_read_only_account_warns_but_boots(monkeypatch, caplog):
-    """The fallback is weaker, not broken, so it must not be fatal."""
+async def test_no_read_only_account_warns_under_auth_and_still_boots(monkeypatch, caplog):
+    """Absent account: a warning, not a refusal to start.
+
+    It was fatal for one release. That failed closed on a configuration that has
+    a working degraded mode -- a read-scoped caller runs on the read-write
+    account -- so it broke every deployment upgrading into it before an operator
+    could provision the account. The guarantee the read scope makes is weaker
+    until they do, which is what the warning is for.
+    """
     from mysql_mcp_server import server as server_module
 
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
     monkeypatch.delenv("MYSQL_RO_USER", raising=False)
 
-    ran = []
+    started = []
 
     async def fake_stdio():
-        ran.append("stdio")
+        started.append(True)
 
     monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
-    with caplog.at_level("WARNING"):
+
+    with caplog.at_level("WARNING", logger="mysql_mcp_server"):
         await server_module.main()
 
-    assert ran == ["stdio"]
-    assert any("MYSQL_RO_USER is not set" in r.message for r in caplog.records)
+    assert started == [True], "a missing read-only account must not stop the server"
+    warnings = [r for r in caplog.records if "MYSQL_RO_USER" in r.getMessage()]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "DROP DATABASE" in message, (
+        "the operator has to learn the consequence, not just the missing variable"
+    )
+    assert "CREATE USER" in message and "GRANT SELECT" in message, (
+        "a warning about a configuration must say how to fix it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_read_only_account_is_silent_without_auth(monkeypatch, caplog):
+    """Without auth there is no scope, so nothing is being claimed.
+
+    This is the original server's configuration: one MySQL account, no tokens,
+    the process boundary as the security boundary. Warning there would be
+    telling an operator their setup is degraded against a guarantee they never
+    asked for.
+    """
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
+    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
+
+    async def fake_stdio():
+        return None
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+
+    with caplog.at_level("WARNING", logger="mysql_mcp_server"):
+        await server_module.main()
+
+    assert not [r for r in caplog.records if "MYSQL_RO_USER" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_a_half_configured_auth_env_does_not_break_the_read_path_check(monkeypatch):
+    """The check asks only whether auth is on.
+
+    `AuthSettings.from_env()` raises on a half-configured auth setup, which is
+    right where auth is about to be wired up and wrong here: an operator running
+    stdio with a stray AUTHPLANE_* variable exported would get an exception from
+    the read-path check instead of a server.
+    """
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
+    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://127.0.0.1:9")
+    monkeypatch.delenv("AUTHPLANE_RESOURCE", raising=False)
+    monkeypatch.delenv("MYSQL_RO_USER", raising=False)
+
+    started = []
+
+    async def fake_stdio():
+        started.append(True)
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+    await server_module.main()
+    assert started == [True]
 
 
 @pytest.mark.asyncio
@@ -575,3 +653,35 @@ async def test_missing_extra_produces_an_actionable_message(monkeypatch):
 
     with pytest.raises(VerifierConfigError, match=r"mysql_mcp_server\[auth\]"):
         await authplane_module.AuthplaneVerifier.create(_settings("http://localhost:9000"))
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_database_is_not_reported_as_a_bad_grant(monkeypatch):
+    """The two findings the grant check can produce need different messages.
+
+    `verify_readonly_account` reports both through one list. Told "MYSQL_RO_USER
+    does not have a read-only privilege set" when the real problem is that MySQL
+    is down, an operator goes and inspects grants that are fine. Found by running
+    the startup path with the database stopped.
+    """
+    from mysql_mcp_server import server as server_module
+
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.setattr(
+        server_module,
+        "verify_readonly_account",
+        lambda: [f"{server_module.UNVERIFIABLE_PREFIX}: Can't connect to MySQL server"],
+    )
+
+    async def fake_stdio():  # pragma: no cover - must not be reached
+        raise AssertionError("server should not have started")
+
+    monkeypatch.setattr(server_module, "_run_stdio_server", fake_stdio)
+
+    with pytest.raises(RuntimeError, match="Could not verify") as caught:
+        await server_module.main()
+
+    message = str(caught.value)
+    assert "MYSQL_HOST" in message, "it must point at the connection, not the grants"
+    assert "privilege set" not in message

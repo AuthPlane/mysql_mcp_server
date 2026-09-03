@@ -378,15 +378,18 @@ async def test_a_read_token_can_list_tools(server, read_token):
         tools = await asyncio.wait_for(session.list_tools(), timeout=30)
 
     names = {tool.name for tool in tools.tools}
-    assert {"read_query", "write_query", "get_schema_info", "get_table_sample"} <= names
+    assert {"execute_sql", "get_schema_info", "get_table_sample"} <= names
+    assert not {"read_query", "write_query"} & names, (
+        "the removed tools must not still be advertised"
+    )
 
 
 @requires_mysql
-async def test_a_read_token_can_run_a_read_query(server, read_token):
+async def test_a_read_token_can_run_a_select(server, read_token):
     """The end-to-end success path: token in, rows out."""
     async with mcp_session(read_token) as session:
         result = await asyncio.wait_for(
-            session.call_tool("read_query", {"query": "SELECT 1 AS one"}), timeout=30
+            session.call_tool("execute_sql", {"query": "SELECT 1 AS one"}), timeout=30
         )
 
     assert result.isError is not True, text_of(result)
@@ -394,33 +397,41 @@ async def test_a_read_token_can_run_a_read_query(server, read_token):
 
 
 @requires_mysql
-@pytest.mark.parametrize("tool", ["write_query", "execute_sql"])
-async def test_a_read_token_is_refused_the_write_tools(server, read_token, tool):
-    """A scope refusal must arrive as a tool error, and must not hang.
+async def test_a_read_token_is_refused_a_write(server, read_token):
+    """A refusal must arrive as a tool error, and must not hang.
 
     This is the regression guard for the bug the first real-client run found. The
     refusal used to be an HTTP 403 on the POST, which a conforming client ignores
     while it waits for a JSON-RPC response that never came. `wait_for` is the
     assertion: a hang fails the test rather than stalling the suite.
+
+    Note whose refusal it is now: the statement reaches MySQL on the SELECT-only
+    account and the *database* refuses it. There is no scope gate on
+    `execute_sql`, so the message is MySQL's denial rather than a scope name --
+    which is the whole point, since a scope gate on arbitrary SQL could only ever
+    have been an opinion about the statement.
     """
     statement = "CREATE TABLE should_not_exist (id INT)"
 
     async with mcp_session(read_token) as session:
         result = await asyncio.wait_for(
-            session.call_tool(tool, {"query": statement}), timeout=30
+            session.call_tool("execute_sql", {"query": statement}), timeout=30
         )
 
     assert result.isError is True
-    message = text_of(result).lower()
-    assert WRITE_SCOPE in message, "the refusal should name the scope required"
+    assert "not permitted" in text_of(result).lower()
 
 
 @requires_mysql
-async def test_a_read_token_is_refused_a_write_hidden_in_read_query(server, read_token):
-    """Statement classification still applies to a correctly scoped caller."""
+async def test_a_read_token_is_refused_a_write_hidden_in_a_comment(server, read_token):
+    """The syntax a classifier misses and a privilege system does not see at all.
+
+    `/* c */ DROP TABLE` was the classifier's problem. On the SELECT-only account
+    it makes no difference: MySQL refuses the DROP whatever it is wrapped in.
+    """
     async with mcp_session(read_token) as session:
         result = await asyncio.wait_for(
-            session.call_tool("read_query", {"query": "/* c */ DROP TABLE anything"}),
+            session.call_tool("execute_sql", {"query": "/* c */ DROP TABLE anything"}),
             timeout=30,
         )
 
@@ -434,26 +445,26 @@ async def test_a_write_token_can_write(server, write_token):
 
     async with mcp_session(write_token) as session:
         created = await asyncio.wait_for(
-            session.call_tool("write_query", {"query": f"CREATE TABLE {table} (id INT)"}),
+            session.call_tool("execute_sql", {"query": f"CREATE TABLE {table} (id INT)"}),
             timeout=30,
         )
         assert created.isError is not True, text_of(created)
 
         try:
             inserted = await asyncio.wait_for(
-                session.call_tool("write_query", {"query": f"INSERT INTO {table} VALUES (7)"}),
+                session.call_tool("execute_sql", {"query": f"INSERT INTO {table} VALUES (7)"}),
                 timeout=30,
             )
             assert inserted.isError is not True, text_of(inserted)
 
             read_back = await asyncio.wait_for(
-                session.call_tool("read_query", {"query": f"SELECT id FROM {table}"}),
+                session.call_tool("execute_sql", {"query": f"SELECT id FROM {table}"}),
                 timeout=30,
             )
             assert "7" in text_of(read_back)
         finally:
             await asyncio.wait_for(
-                session.call_tool("write_query", {"query": f"DROP TABLE IF EXISTS {table}"}),
+                session.call_tool("execute_sql", {"query": f"DROP TABLE IF EXISTS {table}"}),
                 timeout=30,
             )
 
@@ -512,7 +523,7 @@ async def test_a_dpop_bound_token_works_end_to_end(server, live):
         async with ClientSession(read, write) as session:
             await asyncio.wait_for(session.initialize(), timeout=30)
             result = await asyncio.wait_for(
-                session.call_tool("read_query", {"query": "SELECT 1 AS one"}), timeout=30
+                session.call_tool("execute_sql", {"query": "SELECT 1 AS one"}), timeout=30
             )
 
     assert result.isError is not True, text_of(result)
@@ -599,7 +610,7 @@ async def test_a_session_cannot_be_driven_by_another_subject(server, live, read_
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": "read_query", "arguments": {"query": "SELECT 1"}},
+                "params": {"name": "execute_sql", "arguments": {"query": "SELECT 1"}},
             }
             hijacked = await client.post(
                 f"{BASE}{endpoint}",
@@ -675,7 +686,7 @@ async def test_strict_mode_accepts_a_bound_token_with_a_proof(strict_server, liv
         async with ClientSession(read, write) as session:
             await asyncio.wait_for(session.initialize(), timeout=30)
             result = await asyncio.wait_for(
-                session.call_tool("read_query", {"query": "SELECT 1 AS one"}), timeout=30
+                session.call_tool("execute_sql", {"query": "SELECT 1 AS one"}), timeout=30
             )
 
     assert result.isError is not True, text_of(result)

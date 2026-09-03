@@ -93,13 +93,16 @@ def build_app(**middleware_kwargs):
     kwargs = {
         "verifier": verifier,
         "realm": "test-realm",
+        # Synthetic tool names. These tests target the middleware's scope gate,
+        # which is generic over the map it is given -- the server's own tools are
+        # in `tool_scope_map`, where the only SQL tool has an empty entry because
+        # its connection is the gate. Using real names here would tie a
+        # middleware unit test to that choice.
         "tool_scopes": {
-            "read_query": ("mysql:read",),
-            "write_query": ("mysql:write",),
-            "execute_sql": ("mysql:write",),
+            "probe_read": ("mysql:read",),
+            "probe_write": ("mysql:write",),
             "*": ("mysql:write",),
         },
-        "read_only_tools": ("read_query",),
         # The HTTP-layer denial path is opt-in; these tests target it directly.
         "deny_at_http_layer": True,
     }
@@ -187,7 +190,7 @@ def test_messages_requires_a_token_even_with_a_session_id():
     """
     client, _ = build_app()
     response = client.post(
-        "/messages/?session_id=abc123", json=tools_call("read_query")
+        "/messages/?session_id=abc123", json=tools_call("probe_read")
     )
     assert response.status_code == 401
 
@@ -571,7 +574,7 @@ def test_read_scope_can_call_a_read_tool():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("read_query"),
+        json=tools_call("probe_read"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 200
@@ -581,7 +584,7 @@ def test_read_scope_cannot_call_a_write_tool():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("write_query", "DROP TABLE demo"),
+        json=tools_call("probe_write", "DROP TABLE demo"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 403
@@ -593,7 +596,7 @@ def test_scope_denial_tells_the_client_which_scope_is_needed():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("write_query"),
+        json=tools_call("probe_write"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert 'scope="mysql:write"' in response.headers["www-authenticate"]
@@ -679,7 +682,7 @@ def test_body_is_forwarded_intact_after_inspection():
     a failure that looks like an MCP bug, not an auth bug.
     """
     client, _ = build_app()
-    payload = tools_call("read_query", "SELECT " + "1," * 500 + "1")
+    payload = tools_call("probe_read", "SELECT " + "1," * 500 + "1")
     raw = json.dumps(payload).encode()
     response = client.post(
         "/messages/?session_id=abc123",
@@ -706,45 +709,13 @@ def test_oversized_body_is_rejected_not_buffered():
 # than after the transport has already answered 202.
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "DROP TABLE demo",
-        "DELETE FROM demo",
-        "SELECT 1; DROP TABLE demo",
-        "/* c */ DROP TABLE demo",
-        "WITH x AS (SELECT 1) INSERT INTO demo SELECT 4, 'y'",
-        "SELECT * FROM demo INTO OUTFILE '/tmp/leak.csv'",
-        "SELECT LOAD_FILE('/etc/passwd')",
-    ],
-)
-def test_write_statement_on_read_tool_is_refused_with_a_status(query):
-    """403 while an HTTP response still exists.
-
-    After the transport answers 202 the tool runs in the stream's task, and a
-    refusal can only come back as a JSON-RPC error. Catching it here gives the
-    caller a status code it can act on.
-    """
-    client, _ = build_app()
-    response = client.post(
-        "/messages/?session_id=abc123",
-        json=tools_call("read_query", query),
-        headers={"Authorization": f"Bearer {ALICE_BOTH}"},
-    )
-    assert response.status_code == 403, f"{query!r} must not reach the read tool"
-
-
-def test_read_tool_refusal_explains_itself_without_naming_the_database_account():
-    """The caller learns what to fix; it does not learn the MySQL user or host."""
-    client, _ = build_app()
-    response = client.post(
-        "/messages/?session_id=abc123",
-        json=tools_call("read_query", "SELECT * FROM demo INTO OUTFILE '/tmp/x'"),
-        headers={"Authorization": f"Bearer {ALICE_BOTH}"},
-    )
-    description = response.json()["error_description"]
-    assert "OUTFILE" in description
-    assert "@" not in description, "no user@host may appear in a client-visible message"
+# The middleware used to run the statement classifier on read-only tools and
+# answer 403 before the frame reached the transport. That check is gone along
+# with the classifier: the read-only MySQL account refuses these statements
+# itself, including the DDL and the stacked writes a classifier is weakest
+# against. `tests/test_tool_split.py` pins that the read tool forwards on the
+# read-only connection; `tests/test_sql_boundary.py` pins MySQL's refusal
+# against a live server.
 
 
 def test_write_tool_still_accepts_writes():
@@ -752,7 +723,7 @@ def test_write_tool_still_accepts_writes():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("write_query", "DROP TABLE demo"),
+        json=tools_call("probe_write", "DROP TABLE demo"),
         headers={"Authorization": f"Bearer {ALICE_BOTH}"},
     )
     assert response.status_code == 200
@@ -762,7 +733,7 @@ def test_read_tool_accepts_reads():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("read_query", "SELECT * FROM demo WHERE id = 1"),
+        json=tools_call("probe_read", "SELECT * FROM demo WHERE id = 1"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 200
@@ -777,7 +748,7 @@ def test_scope_is_checked_before_statement_content():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("write_query", "DROP TABLE demo"),
+        json=tools_call("probe_write", "DROP TABLE demo"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 403
@@ -788,7 +759,7 @@ def test_scope_enforcement_can_be_disabled_for_authentication_only_mode():
     client, _ = build_app(enforce_scopes=False)
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("write_query"),
+        json=tools_call("probe_write"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 200
@@ -818,14 +789,14 @@ def test_session_is_bound_to_the_subject_that_opened_it():
 
     own = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("read_query"),
+        json=tools_call("probe_read"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert own.status_code == 200, "the subject that opened the session must be able to use it"
 
     other = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("read_query"),
+        json=tools_call("probe_read"),
         headers={"Authorization": f"Bearer {BOB_BOTH}"},
     )
     assert other.status_code == 403, (
@@ -843,7 +814,7 @@ def test_unknown_session_id_is_not_treated_as_bound():
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=neverseen",
-        json=tools_call("read_query"),
+        json=tools_call("probe_read"),
         headers={"Authorization": f"Bearer {ALICE_READ}"},
     )
     assert response.status_code == 200
@@ -855,7 +826,7 @@ def test_session_binding_can_be_disabled():
     client.get("/sse", headers={"Authorization": f"Bearer {ALICE_READ}"})
     response = client.post(
         "/messages/?session_id=abc123",
-        json=tools_call("read_query"),
+        json=tools_call("probe_read"),
         headers={"Authorization": f"Bearer {BOB_BOTH}"},
     )
     assert response.status_code == 200

@@ -17,7 +17,7 @@ specific credential be traced or revoked without the record itself being a
 credential.
 
 **Known limitation.** Records are written at the point of *authorization*, not
-completion — "subject X was permitted to call write_query with this statement",
+completion — "subject X was permitted to call execute_sql with this statement",
 not "and it affected 4 rows". On the legacy SSE transport the tool executes in a
 different task from the request that authorized it (see ``middleware.py``), so no
 identity is available where the outcome is known. Correlating the two would need
@@ -51,6 +51,14 @@ EVENT_DENIED_SESSION = "session_subject_mismatch"
 EVENT_AUTH_FAILED = "authentication_failed"
 EVENT_STREAM_OPENED = "stream_opened"
 EVENT_THROTTLED = "authentication_throttled"
+# A call that was *allowed* but whose authorization was not enforced end to end:
+# a read-scoped token whose SQL ran on the read-write account because no
+# read-only MySQL account is configured. Recorded separately from
+# EVENT_AUTHORIZED because the trail must not claim a guarantee the deployment
+# is not providing -- "authorized under the read scope" and "ran with privileges
+# to drop the database" have to be distinguishable after the fact, and only this
+# record makes them so.
+EVENT_UNENFORCED_READ_SCOPE = "read_scope_not_enforced"
 # Distinct from EVENT_AUTH_FAILED on purpose: this is the server failing, not
 # the caller. Sharing one event would make an authorization-server outage
 # indistinguishable from a burst of bad tokens in the trail -- which is the

@@ -66,8 +66,11 @@ def build(**kwargs):
     defaults = {
         "verifier": SimpleVerifier(),
         "realm": "test",
-        "tool_scopes": {"read_query": ("mysql:read",), "write_query": ("mysql:write",), "*": ("mysql:write",)},
-        "read_only_tools": ("read_query",),
+        "tool_scopes": {
+            "get_schema_info": ("mysql:read",),
+            "execute_sql": (),
+            "*": ("mysql:write",),
+        },
         "deny_at_http_layer": True,
     }
     defaults.update(kwargs)
@@ -78,7 +81,7 @@ def client_for(app) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=RESOURCE)
 
 
-def call(tool="read_query", query="SELECT * FROM demo"):
+def call(tool="execute_sql", query="SELECT * FROM demo"):
     return {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": {"query": query}}}
 
@@ -119,7 +122,7 @@ async def test_authorized_tool_call_records_who_ran_what(audit_records):
     assert entry["sub"] == "alice"
     assert entry["client_id"] == "client-alice"
     assert entry["jti"] == "jti-alice"
-    assert entry["tool"] == "read_query"
+    assert entry["tool"] == "execute_sql"
     assert entry["statement"] == "SELECT * FROM demo"
     assert entry["session_id"] == "s1"
     assert entry["outcome"] == "authorized"
@@ -128,27 +131,32 @@ async def test_authorized_tool_call_records_who_ran_what(audit_records):
 
 @pytest.mark.asyncio
 async def test_scope_denial_is_recorded_with_the_reason(audit_records):
+    """A gated tool called without its scope.
+
+    `execute_sql` cannot be the subject here: its map entry is empty on purpose,
+    so the HTTP layer lets it through and `policy.connection_for` decides -- which is
+    covered at the tool layer below and in test_scope_routing.py.
+    """
     app = build()
     async with client_for(app) as client:
         await client.post(
-            "/messages/?session_id=s1", json=call("write_query", "DROP TABLE demo"),
-            headers={"Authorization": "Bearer ok:alice:mysql:read"},
+            "/messages/?session_id=s1", json=call("get_schema_info", "demo"),
+            headers={"Authorization": "Bearer ok:alice:mysql:write"},
         )
 
     entries = [e for e in audit_records() if e["event"] == "tool_call_denied_scope"]
     assert len(entries) == 1
     assert entries[0]["sub"] == "alice"
-    assert "mysql:write" in entries[0]["reason"]
-    assert entries[0]["statement"] == "DROP TABLE demo"
+    assert "mysql:read" in entries[0]["reason"]
 
 
 @pytest.mark.asyncio
-async def test_statement_denial_and_session_mismatch_are_recorded(audit_records):
+async def test_scope_denial_and_session_mismatch_are_recorded(audit_records):
     app = build()
     async with client_for(app) as client:
         await client.post(
-            "/messages/?session_id=s1", json=call("read_query", "DROP TABLE demo"),
-            headers={"Authorization": "Bearer ok:alice:mysql:read mysql:write"},
+            "/messages/?session_id=s1", json=call("get_schema_info", "demo"),
+            headers={"Authorization": "Bearer ok:alice:mysql:write"},
         )
         await client.get("/sse", headers={"Authorization": "Bearer ok:alice:mysql:read"})
         # See test_auth_middleware.py: this fixture's `/sse` is not long-lived,
@@ -161,7 +169,7 @@ async def test_statement_denial_and_session_mismatch_are_recorded(audit_records)
         )
 
     events = {e["event"] for e in audit_records()}
-    assert "tool_call_denied_statement" in events
+    assert "tool_call_denied_scope" in events
     assert "session_subject_mismatch" in events
 
 
@@ -196,7 +204,7 @@ async def test_long_statements_are_truncated(audit_records):
     huge = "SELECT '" + "x" * 5000 + "'"
     async with client_for(app) as client:
         await client.post(
-            "/messages/?session_id=s1", json=call("read_query", huge),
+            "/messages/?session_id=s1", json=call("execute_sql", huge),
             headers={"Authorization": "Bearer ok:alice:mysql:read"},
         )
 
@@ -214,7 +222,7 @@ async def test_every_record_is_one_line_of_valid_json(audit_records):
     app = build()
     async with client_for(app) as client:
         await client.post(
-            "/messages/?session_id=s1", json=call("read_query", "SELECT 'a\nb'"),
+            "/messages/?session_id=s1", json=call("execute_sql", "SELECT 'a\nb'"),
             headers={"Authorization": "Bearer ok:alice:mysql:read"},
         )
         await client.get("/sse", headers={"Authorization": "Bearer bad"})
@@ -443,12 +451,19 @@ def tool_layer(monkeypatch):
     from mysql_mcp_server import server as server_module
     from mysql_mcp_server.auth import current
 
-    monkeypatch.setattr(server_module, "AUDIT_ENABLED", True)
+    from mysql_mcp_server.auth import policy
+
+    monkeypatch.setattr(policy, "AUDIT_ENABLED", True)
     monkeypatch.setattr(
-        server_module,
-        "REQUIRED_SCOPES",
-        server_module.tool_scope_map("mysql:read", "mysql:write"),
+        policy, "REQUIRED_SCOPES", policy.tool_scope_map("mysql:read", "mysql:write")
     )
+    monkeypatch.setattr(
+        policy, "SCOPE_NAMES", policy.scope_name_map("mysql:read", "mysql:write")
+    )
+    # A read-only account exists, so a read-scoped call takes the enforced path
+    # rather than the audited fail-open one (test_scope_routing.py covers that).
+    monkeypatch.setenv("MYSQL_RO_USER", "mcp_ro")
+    monkeypatch.setenv("MYSQL_RO_PASSWORD", "ro_pass")
 
     async def run(identity, name, arguments):
         # Awaited inside the binding, not merely started: returning the coroutine
@@ -470,65 +485,83 @@ def _identity(*scopes):
 
 
 async def test_a_scope_denial_in_the_tool_layer_is_audited(tool_layer, audit_records):
+    """A token carrying no scope at all. `execute_sql` has no scope gate in the
+    map -- the connection is the gate -- so this denial comes from
+    `policy.connection_for`, and it must be audited like any other."""
     with pytest.raises(Exception):
-        await tool_layer(
-            _identity("mysql:read"), "write_query", {"query": "DROP TABLE t"}
-        )
+        await tool_layer(_identity(), "execute_sql", {"query": "DROP TABLE t"})
 
     entries = [e for e in audit_records() if e["event"] == "tool_call_denied_scope"]
     assert len(entries) == 1, "the refusal must appear in the trail, not only the log"
     entry = entries[0]
     assert entry["outcome"] == "denied"
     assert entry["sub"] == "alice"
-    assert entry["tool"] == "write_query"
+    assert entry["tool"] == "execute_sql"
     assert entry["statement"] == "DROP TABLE t"
     assert "mysql:write" in entry["reason"]
     assert not [e for e in audit_records() if e["event"] == "tool_call_authorized"]
 
 
-async def test_a_statement_denial_in_the_tool_layer_is_audited(tool_layer, audit_records):
-    """Correctly scoped, still refused: classification, not authorization.
+async def test_a_database_refusal_in_the_tool_layer_is_audited(
+    tool_layer, audit_records, monkeypatch
+):
+    """A refusal that came from MySQL still lands in the trail.
 
     Recorded under a different event from the scope denial because the two are
     different findings for whoever reads the trail -- one is a caller without
-    permission, the other a caller with permission sending something the tool
-    does not accept.
+    permission, the other a caller with permission whose statement the database
+    refused. `run_query` is replaced with the refusal MySQL gives the read-only
+    account, since the tool layer no longer inspects statements itself.
     """
-    with pytest.raises(Exception):
+    from mysql_mcp_server import server as server_module
+    from mysql_mcp_server.sqlguard import DENIAL_MESSAGE, StatementDenied
+
+    async def refuse(query, read_only=False):
+        raise StatementDenied(DENIAL_MESSAGE)
+
+    monkeypatch.setattr(server_module, "run_query", refuse)
+
+    with pytest.raises(StatementDenied):
         await tool_layer(
             _identity("mysql:read", "mysql:write"),
-            "read_query",
+            "execute_sql",
             {"query": "DROP TABLE t"},
         )
 
     entries = [e for e in audit_records() if e["event"] == "tool_call_denied_statement"]
     assert len(entries) == 1
-    assert entries[0]["tool"] == "read_query"
+    assert entries[0]["tool"] == "execute_sql"
     assert entries[0]["outcome"] == "denied"
 
 
 async def test_the_tool_layer_does_not_audit_when_auditing_is_off(
     tool_layer, audit_records, monkeypatch
 ):
-    from mysql_mcp_server import server as server_module
+    from mysql_mcp_server.auth import policy
 
-    monkeypatch.setattr(server_module, "AUDIT_ENABLED", False)
+    monkeypatch.setattr(policy, "AUDIT_ENABLED", False)
     with pytest.raises(Exception):
-        await tool_layer(
-            _identity("mysql:read"), "write_query", {"query": "DROP TABLE t"}
-        )
+        await tool_layer(_identity(), "execute_sql", {"query": "DROP TABLE t"})
     assert audit_records() == []
 
 
-async def test_stdio_has_no_identity_and_is_not_audited(tool_layer, audit_records):
+async def test_stdio_has_no_identity_and_is_not_audited(tool_layer, audit_records, monkeypatch):
     """No identity means authorization does not apply, not that it was denied.
 
     The stdio transport has no HTTP layer and no token. A refusal there is still
     a refusal, but it belongs to nobody, so it must not produce a record naming a
     subject -- and enabling auth must not become the only way to use the server.
     """
-    with pytest.raises(Exception):
-        await tool_layer(None, "read_query", {"query": "DROP TABLE t"})
+    from mysql_mcp_server import server as server_module
+    from mysql_mcp_server.sqlguard import DENIAL_MESSAGE, StatementDenied
+
+    async def refuse(query, read_only=False):
+        raise StatementDenied(DENIAL_MESSAGE)
+
+    monkeypatch.setattr(server_module, "run_query", refuse)
+
+    with pytest.raises(StatementDenied):
+        await tool_layer(None, "execute_sql", {"query": "DROP TABLE t"})
 
     entries = [e for e in audit_records() if e["event"].startswith("tool_call_denied")]
     assert entries, "the denial is still recorded"

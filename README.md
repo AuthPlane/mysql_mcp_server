@@ -87,7 +87,7 @@ MCP_AUTH_MODE=none                # 'authplane' to enable; 'none' (default) chan
 AUTHPLANE_ISSUER=                 # Authplane base URL, e.g. http://localhost:9000
 AUTHPLANE_RESOURCE=               # This server's canonical URI; must equal the token's 'aud'
 MYSQL_SCOPE_READ=mysql:read       # Scope required by the read tools
-MYSQL_SCOPE_WRITE=mysql:write     # Scope required by write_query and execute_sql
+MYSQL_SCOPE_WRITE=mysql:write     # Scope that routes execute_sql to the read-write account
 MCP_AUTH_BIND_SESSION=true        # Bind each SSE session to the subject that opened it
 MCP_AUTH_AUDIT=true               # Structured audit records (see Auditing below)
 MCP_AUTH_DPOP=off                 # off | optional | required (RFC 9449 sender-constrained tokens)
@@ -129,24 +129,11 @@ When `MYSQL_DATABASE` is not set, the server operates in multi-database mode:
 
 ## Available Tools
 
-### `read_query`
-Runs a read-only SQL query.
-- **Arguments:** `query` (string)
-- **Features:** Supports `SELECT`, `SHOW`, `DESCRIBE`, and `EXPLAIN`. Marked read-only and non-destructive so clients can call it without prompting.
-- **Refuses:** Anything that writes data or schema, plus constructs a `SELECT`-only grant would otherwise permit — `INTO OUTFILE`, `LOAD_FILE()`, `FOR UPDATE`, `SLEEP()`, `BENCHMARK()`. Comments and string literals are stripped before classification, so `/* c */ DROP TABLE t` and `WITH x AS (...) INSERT ...` are refused too.
-- **Enforced by MySQL, not just by classification:** when `MYSQL_RO_USER` is set, this tool connects as that account. See [Read/write separation](#readwrite-separation).
-- **Limitation:** Single statements only. Multi-statement queries are not supported.
-- **Cross-database:** Use `database.table` notation to query any database regardless of the `MYSQL_DATABASE` setting.
-
-### `write_query`
-Runs a SQL statement that modifies data or schema.
-- **Arguments:** `query` (string)
-- **Features:** `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`. Marked destructive.
-- **Limitation:** Single statements only.
-
 ### `execute_sql`
-**Deprecated — use `read_query` or `write_query`.** Executes any single SQL statement, read or write. Because it accepts both, it cannot be authorized precisely and is treated as a write everywhere (it requires the write scope when authentication is enabled). Kept for backward compatibility with existing configurations.
+Executes any single SQL statement, read or write. **The privileges it runs with follow the caller's scope:** a caller holding only `MYSQL_SCOPE_READ` reaches the database as the read-only account, so a write is refused by MySQL itself.
 - **Arguments:** `query` (string)
+- **Authorization:** write scope → read-write connection; read scope only → `SELECT`-only connection; neither → refused before the database is reached. With authentication disabled (including stdio) it keeps the read-write connection, as before.
+- **No statement inspection.** The server does not parse your SQL to decide what it is. The connection's MySQL privileges decide, and MySQL enforces them — which also covers stacked writes and version-gated comments such as `/*!DROP TABLE t*/`, the syntax classifiers are weakest against.
 - **Limitation:** Single statements only. Multi-statement queries are not supported.
 - **Cross-database:** Use `database.table` notation to query any database regardless of the `MYSQL_DATABASE` setting.
 
@@ -313,13 +300,13 @@ python -m mysql_mcp_server
 
 Both MCP endpoints are protected: `GET /sse`, which issues the session id, and `POST /messages/`, which carries every tool call. The health probe `/` and the RFC 9728 metadata document at `/.well-known/oauth-protected-resource` stay public, since a client cannot obtain a token without first discovering where tokens come from.
 
-Tokens are accepted only in the `Authorization` header. Per-tool scopes are enforced: the read tools require `MYSQL_SCOPE_READ`, `write_query` and the deprecated `execute_sql` require `MYSQL_SCOPE_WRITE`. DPoP (RFC 9449) and per-request revocation checks are supported and ship disabled.
+Tokens are accepted only in the `Authorization` header. `get_schema_info` and `get_table_sample` require `MYSQL_SCOPE_READ`, as do MCP resource reads. `execute_sql` is authorized differently — the caller's scope selects the database account, so the grants on that account decide the outcome, and a caller holding neither scope is refused. DPoP (RFC 9449) and per-request revocation checks are supported and ship disabled.
 
 📖 **See [AUTHENTICATION.md](AUTHENTICATION.md)** for how it works, which SDK calls are used and where, the full configuration reference, and the known limits.
 
 ## Read/write separation
 
-`read_query` refuses writes by inspecting the statement, but statement inspection is not a security boundary — there is always one more syntax nobody anticipated. Set a read-only MySQL account and the guarantee moves into the database:
+The read/write boundary is **MySQL's privilege system**, not this server. Nothing in the process parses your SQL to decide whether it writes; the caller's scope picks which MySQL account runs the statement, and that account's grants decide the outcome. Create the read-only account:
 
 ```sql
 CREATE USER 'mcp_ro'@'%' IDENTIFIED BY 'a-strong-password';
@@ -331,9 +318,11 @@ export MYSQL_RO_USER=mcp_ro
 export MYSQL_RO_PASSWORD=a-strong-password
 ```
 
-The read tools then connect as that account, so a write that gets past classification is refused by MySQL itself. The grants are checked at startup and **the server refuses to start if that account can write** — a misconfiguration that would otherwise look identical to a correct setup.
+A read-scoped caller then connects as that account, so a write is refused by MySQL — including DDL, stacked statements, and anything smuggled through a version-gated comment. The grants are checked at startup and **the server refuses to start if that account can write**, a misconfiguration that would otherwise look identical to a correct setup.
 
-Without `MYSQL_RO_USER` the read path falls back to wrapping reads in `START TRANSACTION READ ONLY`, which still blocks writes but is weaker: statements that only *read* the filesystem, such as `LOAD_FILE()`, are permitted by a read-only transaction and blocked only by not holding the `FILE` privilege. The server logs a warning at startup in this mode.
+There is no software fallback. An earlier version wrapped reads in `START TRANSACTION READ ONLY`; measured against MySQL 8.4 that refuses `INSERT`/`UPDATE`/`DELETE` but lets `CREATE`, `DROP`, `ALTER`, `TRUNCATE` and `RENAME` through, because DDL commits implicitly and ends the transaction. It was removed rather than left in place looking like a boundary.
+
+**Without `MYSQL_RO_USER`,** a read-scoped caller runs on the read-write account and the read scope has nothing enforcing it: a `DROP DATABASE` from a read-only token would succeed. This is permitted so that enabling authentication does not require provisioning a database account first, but with authentication on the server warns about it at startup, warns once when it first happens, and audits every such call as `read_scope_not_enforced`. With authentication off there is no scope to enforce and no warning is emitted.
 
 ## Security Best Practices
 This MCP implementation requires database access to function. For security:

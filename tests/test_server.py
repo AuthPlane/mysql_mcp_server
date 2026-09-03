@@ -13,27 +13,10 @@ def test_server_initialization():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 5
-    assert any(t.name == "read_query" for t in tools)
-    assert any(t.name == "write_query" for t in tools)
+    assert len(tools) == 3
     assert any(t.name == "execute_sql" for t in tools)
     assert any(t.name == "get_schema_info" for t in tools)
     assert any(t.name == "get_table_sample" for t in tools)
-
-
-@pytest.mark.asyncio
-async def test_read_and_write_tools_declare_their_nature():
-    """The annotations are what a client uses to decide whether to prompt a human.
-
-    `read_query` claiming to be destructive (or `write_query` claiming not to be)
-    would mislead every client that respects these hints.
-    """
-    tools = {t.name: t for t in await list_tools()}
-    assert tools["read_query"].annotations.readOnlyHint is True
-    assert tools["read_query"].annotations.destructiveHint is False
-    assert tools["write_query"].annotations.readOnlyHint is False
-    assert tools["write_query"].annotations.destructiveHint is True
-    assert "DEPRECATED" in tools["execute_sql"].description
 
 
 @pytest.mark.asyncio

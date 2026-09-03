@@ -109,8 +109,9 @@ def build(verifier, chunked_session_event: bool = False, **kwargs):
     defaults = {
         "verifier": verifier,
         "realm": "test",
-        "tool_scopes": {"read_query": ("mysql:read",), "*": ("mysql:write",)},
-        "read_only_tools": ("read_query",),
+        # Synthetic tool name; this file targets the middleware's token
+        # handling, not the server's tool set.
+        "tool_scopes": {"probe_read": ("mysql:read",), "*": ("mysql:write",)},
     }
     defaults.update(kwargs)
     return AuthMiddleware(app, **defaults)
@@ -124,7 +125,7 @@ CALL = {
     "jsonrpc": "2.0",
     "id": 1,
     "method": "tools/call",
-    "params": {"name": "read_query", "arguments": {"query": "SELECT 1"}},
+    "params": {"name": "probe_read", "arguments": {"query": "SELECT 1"}},
 }
 
 
