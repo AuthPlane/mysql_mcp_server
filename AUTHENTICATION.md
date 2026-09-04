@@ -47,14 +47,14 @@ in [`pyproject.toml`](pyproject.toml).
 
 ```bash
 export MCP_TRANSPORT=sse
-export MCP_AUTH_MODE=authplane
-export AUTHPLANE_ISSUER=https://auth.example.com    # your Authplane server
-export AUTHPLANE_RESOURCE=https://mcp.example.com   # this server's canonical URI
+export MCP_AUTH_MODE=oauth
+export MCP_OAUTH_ISSUER=https://auth.example.com    # your Authplane server
+export MCP_OAUTH_RESOURCE=https://mcp.example.com   # this server's canonical URI
 export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...   # a SELECT-only account; without it the read scope is not enforced
 python -m mysql_mcp_server
 ```
 
-`AUTHPLANE_RESOURCE` must equal the `aud` claim of the tokens Authplane issues
+`MCP_OAUTH_RESOURCE` must equal the `aud` claim of the tokens Authplane issues
 for this server, byte for byte. A trailing slash is enough to break it. This is
 the check that prevents a token minted for a different resource from being
 replayed here.
@@ -104,7 +104,7 @@ Both MCP endpoints are protected. Protecting only `/sse` would protect nothing,
 since a caller holding a session id can POST directly.
 
 The discovery path follows the resource URI. RFC 9728 §3 puts the resource's own
-path *after* the well-known segment, so `AUTHPLANE_RESOURCE=https://host/mysql` is
+path *after* the well-known segment, so `MCP_OAUTH_RESOURCE=https://host/mysql` is
 discovered at `/.well-known/oauth-protected-resource/mysql`. The route and the
 `resource_metadata` URL in the challenge are both derived from the same value, so
 they cannot drift apart. The server logs the path it serves at on startup.
@@ -169,23 +169,35 @@ and auth is off.
 
 ## Configuration reference
 
-Only `MCP_AUTH_MODE`, `AUTHPLANE_ISSUER` and `AUTHPLANE_RESOURCE` are required.
-Names in the `AUTHPLANE_*` namespace follow the SDK's own documentation; the
-`MCP_AUTH_*` names are this server's.
+Only `MCP_AUTH_MODE`, `MCP_OAUTH_ISSUER` and `MCP_OAUTH_RESOURCE` are required.
+
+Every name is in this server's own namespace. `MCP_OAUTH_*` are the parameters
+an authorization server dictates -- an issuer, a resource identifier, signing
+algorithms, a clock skew -- and `MCP_AUTH_*` are this server's own policy
+choices. No provider appears in either, because none of these values are
+provider-specific.
+
+> **Also accepted.** Each `MCP_OAUTH_*` name above is also read under an
+> `AUTHPLANE_*` spelling (`AUTHPLANE_ISSUER` for `MCP_OAUTH_ISSUER`, and so on),
+> and `MCP_AUTH_MODE=authplane` is accepted as `oauth`. Those were the names
+> during development, so anything configured against a pre-release checkout
+> keeps working. Using one logs a warning naming its replacement; where both are
+> set, the `MCP_OAUTH_*` name wins. Configure new deployments with the names in
+> the table.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MCP_AUTH_MODE` | `none` | `authplane` to enable. `none` disables everything below |
-| `AUTHPLANE_ISSUER` | — | Authplane base URL, e.g. `https://auth.example.com` |
-| `AUTHPLANE_RESOURCE` | — | This server's canonical URI; must equal the token's `aud` |
-| `AUTHPLANE_SCOPES` | read + write scope | Comma-separated scopes advertised in the metadata document |
-| `AUTHPLANE_ALLOWED_ALGORITHMS` | `ES256,RS256` | Accepted signing algorithms. `none` is rejected outright |
+| `MCP_AUTH_MODE` | `none` | `oauth` to enable. `none` disables everything below |
+| `MCP_OAUTH_ISSUER` | — | The authorization server's base URL, e.g. `https://auth.example.com` |
+| `MCP_OAUTH_RESOURCE` | — | This server's canonical URI; must equal the token's `aud` |
+| `MCP_OAUTH_SCOPES` | read + write scope | Comma-separated scopes advertised in the metadata document |
+| `MCP_OAUTH_ALLOWED_ALGORITHMS` | `ES256,RS256` | Accepted signing algorithms. `none` is rejected outright |
 | `MCP_AUTH_DPOP_ALGORITHMS` | *(the token algorithms)* | Algorithms a DPoP **proof** may be signed with. Separate from the token algorithms because the two constrain different parties: what the authorization server signs tokens with is a deployment fact, what a client may sign proofs with is a policy choice. Set it to restrict proofs to `ES256` while `RS256`-signed tokens stay acceptable |
-| `AUTHPLANE_CLOCK_SKEW_SECONDS` | `30` | Clock-drift tolerance. Values above 300 log a warning |
-| `AUTHPLANE_CLIENT_ID` | — | This server's client id, required for revocation checks |
-| `AUTHPLANE_CLIENT_SECRET` | — | Matching secret |
-| `AUTHPLANE_REALM` | `mysql_mcp_server` | Realm in the `WWW-Authenticate` challenge |
-| `AUTHPLANE_DEV_MODE` | `false` | **Required** to boot against an `http://` issuer at all -- not merely to silence a warning. The SDK's SSRF guard refuses to fetch discovery or JWKS from a non-`https`, non-public host unless this is set; without it, startup fails with `Could not reach the authorization server`, which reads like the AS is down even when it is not. Needed for any `localhost` or `127.0.0.1` issuer, i.e. every local development setup |
+| `MCP_OAUTH_CLOCK_SKEW_SECONDS` | `30` | Clock-drift tolerance. Values above 300 log a warning |
+| `MCP_OAUTH_CLIENT_ID` | — | This server's client id, required for revocation checks |
+| `MCP_OAUTH_CLIENT_SECRET` | — | Matching secret |
+| `MCP_OAUTH_REALM` | `mysql_mcp_server` | Realm in the `WWW-Authenticate` challenge |
+| `MCP_OAUTH_DEV_MODE` | `false` | **Required** to boot against an `http://` issuer at all -- not merely to silence a warning. The SDK's SSRF guard refuses to fetch discovery or JWKS from a non-`https`, non-public host unless this is set; without it, startup fails with `Could not reach the authorization server`, which reads like the AS is down even when it is not. Needed for any `localhost` or `127.0.0.1` issuer, i.e. every local development setup |
 | `MYSQL_SCOPE_READ` | `mysql:read` | Scope the read tools require |
 | `MYSQL_SCOPE_WRITE` | `mysql:write` | Scope the write tools require |
 | `MCP_AUTH_ENFORCE_SCOPES` | `true` | Set `false` to authenticate without per-tool scope checks |
@@ -200,13 +212,13 @@ Names in the `AUTHPLANE_*` namespace follow the SDK's own documentation; the
 ### Local development against `http://`
 
 ```dotenv
-MCP_AUTH_MODE=authplane
-AUTHPLANE_ISSUER=http://localhost:9000
-AUTHPLANE_RESOURCE=http://localhost:8000
-AUTHPLANE_DEV_MODE=true
+MCP_AUTH_MODE=oauth
+MCP_OAUTH_ISSUER=http://localhost:9000
+MCP_OAUTH_RESOURCE=http://localhost:8000
+MCP_OAUTH_DEV_MODE=true
 ```
 
-`AUTHPLANE_DEV_MODE=true` relaxes three SSRF-guard restrictions the SDK
+`MCP_OAUTH_DEV_MODE=true` relaxes three SSRF-guard restrictions the SDK
 otherwise enforces unconditionally: `allow_http`, `allow_localhost`, and
 `allow_private_networks`. All three matter for a bare `localhost` issuer --
 switching the URL to `https://localhost:9000` is not enough on its own,
@@ -394,7 +406,7 @@ sign a new proof for every request rather than setting a header once. With
 `httpx` that means an `httpx.Auth` implementation; `tests/test_authplane_e2e.py`
 has a working one.
 
-The URL a proof is checked against is built from `AUTHPLANE_RESOURCE` plus the
+The URL a proof is checked against is built from `MCP_OAUTH_RESOURCE` plus the
 request path, never from the `Host` header. `Host` is caller-controlled, so
 deriving it from there would let a caller choose what their own proof has to
 match, and behind a reverse proxy it would differ from what the client signed.
@@ -405,7 +417,7 @@ Sign proofs for the canonical resource URI, not for the address you connect to.
 The `WWW-Authenticate` challenge names the schemes this server actually accepts,
 one header value per scheme: `Bearer` when DPoP is `off`, both when `optional`,
 and `DPoP` alone when `required`. The DPoP challenge carries an `algs` parameter
-listing `AUTHPLANE_ALLOWED_ALGORITHMS` so a client knows what to sign with.
+listing `MCP_OAUTH_ALLOWED_ALGORITHMS` so a client knows what to sign with.
 Every challenge carries `resource_metadata`, so discovery works no matter which
 scheme the client picks.
 
@@ -418,8 +430,8 @@ revoked upstream stays valid here until it expires.
 `MCP_AUTH_REVOCATION_CHECK=true` checks every request against Authplane's
 introspection endpoint instead, restoring immediate revocation at the cost of a
 network round trip per request and a hard dependency on Authplane being
-reachable. Introspection is an authenticated call, so `AUTHPLANE_CLIENT_ID` and
-`AUTHPLANE_CLIENT_SECRET` are required; without them the server refuses to start.
+reachable. Introspection is an authenticated call, so `MCP_OAUTH_CLIENT_ID` and
+`MCP_OAUTH_CLIENT_SECRET` are required; without them the server refuses to start.
 
 Checks fail closed. If the question "is this token still valid?" cannot be
 answered, the request is refused. For a server that executes SQL, an unanswerable
@@ -550,7 +562,7 @@ Authplane and per-subject pooling. None of that is a change to this middleware.
 
 ### Registering the resource URI
 
-`AUTHPLANE_RESOURCE` is compared byte-for-byte on both sides and **neither side
+`MCP_OAUTH_RESOURCE` is compared byte-for-byte on both sides and **neither side
 normalises it**: the SDK validates `aud` with an exact string comparison, and
 authserver's resource registry looks the value up verbatim (a miss surfaces as
 `unknown resource`, which does not hint at why).
@@ -561,7 +573,7 @@ breaks the browser flow. **So a root resource must be registered in Authplane
 with the trailing slash:**
 
 ```
-AUTHPLANE_RESOURCE=http://localhost:8000    # what you export
+MCP_OAUTH_RESOURCE=http://localhost:8000    # what you export
 http://localhost:8000/                      # what to register in Authplane
 ```
 
@@ -674,4 +686,13 @@ and never imports a provider directly. Authplane is the implementation shipped
 and the only one supported. Supporting a different OAuth 2.1 server would mean
 writing a class satisfying that protocol and registering it in `build_verifier()`.
 
-Nothing in this repo has been tested against another authorization server.
+The configuration surface is neutral in the same way: every `MCP_OAUTH_*` value
+is one any OAuth 2.1 server issues, so a second backend would not add or rename
+a single operator-facing variable. `build_verifier()` is the only place a
+provider is named at all, and `MCP_AUTH_MODE=oauth` selects Authplane there
+because it is the backend that ships, not because the mode means Authplane.
+
+**Nothing in this repo has been tested against another authorization server.**
+A neutral seam and a neutral configuration surface are a claim about structure,
+not about coverage: the second verifier has never been written, so the cost of
+writing one is an estimate.

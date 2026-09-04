@@ -376,7 +376,7 @@ def test_prm_route_path_follows_the_resource(metadata_url, expected):
 
 
 class PathResourceVerifier(FakeVerifier):
-    """A resource mounted under a path, as `AUTHPLANE_RESOURCE=.../mysql`."""
+    """A resource mounted under a path, as `MCP_OAUTH_RESOURCE=.../mysql`."""
 
     RESOURCE = "https://mcp.example.com/mysql"
     METADATA = "https://mcp.example.com/.well-known/oauth-protected-resource/mysql"

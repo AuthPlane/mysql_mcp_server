@@ -281,8 +281,8 @@ async def test_required_mode_still_leaves_public_paths_open():
 @pytest.fixture
 def base_env(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.delenv("MCP_AUTH_DPOP", raising=False)
     return monkeypatch
 

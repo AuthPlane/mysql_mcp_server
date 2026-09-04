@@ -20,6 +20,7 @@ from starlette.routing import Route
 
 from mysql_mcp_server.auth import AuthSettings, build_verifier
 from mysql_mcp_server.auth.protocol import VerifierConfigError
+from mysql_mcp_server.auth.settings import CANONICAL_MODE, RENAMED_ENV_VARS
 
 # The Authplane SDK ships in the optional [auth] extra, so it is absent on any
 # base install. Tests that exercise the real verifier skip rather than error,
@@ -41,8 +42,8 @@ requires_sdk = pytest.mark.skipif(
 @pytest.fixture
 def clean_env(monkeypatch):
     for name in (
-        "MCP_AUTH_MODE", "AUTHPLANE_ISSUER", "AUTHPLANE_RESOURCE", "AUTHPLANE_SCOPES",
-        "AUTHPLANE_ALLOWED_ALGORITHMS", "AUTHPLANE_CLOCK_SKEW_SECONDS", "AUTHPLANE_DEV_MODE",
+        "MCP_AUTH_MODE", "MCP_OAUTH_ISSUER", "MCP_OAUTH_RESOURCE", "MCP_OAUTH_SCOPES",
+        "MCP_OAUTH_ALLOWED_ALGORITHMS", "MCP_OAUTH_CLOCK_SKEW_SECONDS", "MCP_OAUTH_DEV_MODE",
         "MYSQL_SCOPE_READ", "MYSQL_SCOPE_WRITE", "MCP_AUTH_REVOCATION_CHECK",
         "MCP_AUTH_MAX_AUTH_FAILURES", "MCP_AUTH_AUDIT",
     ):
@@ -73,12 +74,135 @@ def test_unknown_mode_is_rejected_rather_than_silently_ignored(clean_env):
         AuthSettings.from_env()
 
 
+# --------------------------------------------------------------------------
+# The configuration surface carries no provider's name. The prefixed spellings
+# these variables had during development stay readable, which is a documented
+# promise rather than a convenience -- so it is asserted, not assumed.
+# --------------------------------------------------------------------------
+
+def _minimal_oauth_env(env, *, issuer=True, resource=True):
+    env.setenv("MCP_AUTH_MODE", CANONICAL_MODE)
+    if issuer:
+        env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    if resource:
+        env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+
+
+def test_documented_mode_is_the_protocol_not_the_backend(clean_env):
+    """`MCP_AUTH_MODE=oauth` is what the docs and .env.example carry."""
+    _minimal_oauth_env(clean_env)
+    settings = AuthSettings.from_env()
+    assert settings.enabled is True
+    assert settings.mode == CANONICAL_MODE
+
+
+@pytest.mark.parametrize("spelling", ["authplane", "AuthPlane", "AUTHPLANE"])
+def test_pre_rename_mode_still_boots_and_normalises(clean_env, spelling):
+    """`authplane` was the mode during development, before it named the protocol.
+
+    Refusing to boot on it would take a *protected* server down, and the
+    operator's fastest way back up is a value that boots -- which may well be
+    `none`. It resolves to the canonical mode so `build_verifier` dispatches on
+    one spelling.
+    """
+    clean_env.setenv("MCP_AUTH_MODE", spelling)
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    assert AuthSettings.from_env().mode == CANONICAL_MODE
+
+
+def test_mode_alias_normalises_on_hand_built_settings_too(clean_env):
+    """The harness and embedding applications construct settings directly."""
+    settings = AuthSettings(enabled=True, mode="authplane")
+    assert settings.mode == CANONICAL_MODE
+
+
+@pytest.mark.parametrize("current,legacy", sorted(RENAMED_ENV_VARS.items()))
+def test_every_renamed_variable_still_reads_its_predecessor(clean_env, current, legacy):
+    """Parametrised over the table itself, so a new entry cannot ship untested."""
+    # Start from a configuration that boots, then move exactly one variable to
+    # its pre-rename spelling. Issuer and resource are required, so for those
+    # two the legacy name is carrying the value the boot depends on.
+    _minimal_oauth_env(clean_env)
+    clean_env.delenv(current, raising=False)
+    # Values that have to parse as something specific; the rest take a URL.
+    values = {
+        "MCP_OAUTH_CLOCK_SKEW_SECONDS": "45",
+        "MCP_OAUTH_ALLOWED_ALGORITHMS": "ES256",
+        "MCP_OAUTH_DEV_MODE": "true",
+        "MCP_OAUTH_SCOPES": "a:read",
+        "MCP_OAUTH_REALM": "legacy-realm",
+        "MCP_OAUTH_CLIENT_ID": "c",
+        "MCP_OAUTH_CLIENT_SECRET": "s",
+    }
+    clean_env.setenv(legacy, values.get(current, "http://localhost:9000"))
+
+    # The assertion is that it boots at all: every one of these is either
+    # required or validated, so a dropped fallback surfaces as a raise here.
+    assert AuthSettings.from_env().enabled is True
+
+
+def test_pre_rename_value_is_honoured_with_its_meaning_intact(clean_env):
+    """Not just "it boots" -- the value arrives where it belongs."""
+    _minimal_oauth_env(clean_env)
+    clean_env.delenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", raising=False)
+    clean_env.setenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "45")
+    assert AuthSettings.from_env().clock_skew_seconds == 45
+
+
+def test_current_name_wins_over_its_predecessor(clean_env):
+    """An operator part way through the rename has both set."""
+    _minimal_oauth_env(clean_env)
+    clean_env.setenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", "10")
+    clean_env.setenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "45")
+    assert AuthSettings.from_env().clock_skew_seconds == 10
+
+
+def test_blank_current_name_falls_back_rather_than_failing_the_boot(clean_env):
+    """A fresh .env.example leaves the documented names blank beside a populated one.
+
+    Treating the blank as the answer would fail a boot whose configuration is
+    sitting in the environment one variable away.
+    """
+    _minimal_oauth_env(clean_env, issuer=False)
+    clean_env.setenv("MCP_OAUTH_ISSUER", "")
+    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
+    assert AuthSettings.from_env().issuer == "http://localhost:9000"
+
+
+def test_using_a_pre_rename_name_warns_and_names_its_replacement(clean_env, caplog):
+    """A silent fallback is a rename nobody ever completes."""
+    _minimal_oauth_env(clean_env)
+    clean_env.delenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", raising=False)
+    clean_env.setenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "45")
+    with caplog.at_level("WARNING"):
+        AuthSettings.from_env()
+    assert any(
+        "AUTHPLANE_CLOCK_SKEW_SECONDS" in r.message
+        and "MCP_OAUTH_CLOCK_SKEW_SECONDS" in r.message
+        for r in caplog.records
+    ), "the warning has to name both spellings to be actionable"
+
+
+def test_no_provider_name_remains_in_the_configuration_surface(clean_env):
+    """The point of the rename: what an operator sets carries no vendor's name.
+
+    Asserted against the error text an operator actually meets, because that is
+    the other place a variable name is published.
+    """
+    clean_env.setenv("MCP_AUTH_MODE", CANONICAL_MODE)
+    with pytest.raises(VerifierConfigError) as caught:
+        AuthSettings.from_env()
+    assert "AUTHPLANE" not in str(caught.value).upper()
+    assert "MCP_OAUTH_ISSUER" in str(caught.value)
+
+
 @pytest.mark.parametrize(
     "present,missing",
     [
-        ({"AUTHPLANE_ISSUER": "http://localhost:9000"}, "AUTHPLANE_RESOURCE"),
-        ({"AUTHPLANE_RESOURCE": "http://localhost:8000"}, "AUTHPLANE_ISSUER"),
-        ({}, "AUTHPLANE_ISSUER"),
+        ({"MCP_OAUTH_ISSUER": "http://localhost:9000"}, "MCP_OAUTH_RESOURCE"),
+        ({"MCP_OAUTH_RESOURCE": "http://localhost:8000"}, "MCP_OAUTH_ISSUER"),
+        ({}, "MCP_OAUTH_ISSUER"),
     ],
 )
 def test_auth_on_without_required_settings_fails_at_startup(clean_env, present, missing):
@@ -96,18 +220,18 @@ def test_alg_none_is_refused_in_configuration(clean_env):
     relying on the verifier to reject each token.
     """
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
-    clean_env.setenv("AUTHPLANE_ALLOWED_ALGORITHMS", "ES256,none")
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    clean_env.setenv("MCP_OAUTH_ALLOWED_ALGORITHMS", "ES256,none")
     with pytest.raises(VerifierConfigError, match="none"):
         AuthSettings.from_env()
 
 
 def test_empty_algorithm_list_is_refused(clean_env):
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
-    clean_env.setenv("AUTHPLANE_ALLOWED_ALGORITHMS", " , ")
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    clean_env.setenv("MCP_OAUTH_ALLOWED_ALGORITHMS", " , ")
     with pytest.raises(VerifierConfigError):
         AuthSettings.from_env()
 
@@ -115,8 +239,8 @@ def test_empty_algorithm_list_is_refused(clean_env):
 def test_identical_read_and_write_scopes_are_refused(clean_env):
     """Identical values collapse the read/write split into no split at all."""
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     clean_env.setenv("MYSQL_SCOPE_READ", "mysql:all")
     clean_env.setenv("MYSQL_SCOPE_WRITE", "mysql:all")
     with pytest.raises(VerifierConfigError, match="collapse"):
@@ -131,8 +255,8 @@ def test_issuer_trailing_slash_is_stripped(clean_env):
     bare origin with no trailing slash -- so stripping one here is correct.
     """
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000/")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000/")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     settings = AuthSettings.from_env()
     assert settings.issuer == "http://localhost:9000"
 
@@ -160,8 +284,8 @@ def test_issuer_trailing_slash_is_stripped(clean_env):
 def test_resource_root_path_is_canonicalised(clean_env, given, expected):
     """The Resource URI must match what a real client sends, byte-for-byte."""
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    clean_env.setenv("AUTHPLANE_RESOURCE", given)
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", given)
     settings = AuthSettings.from_env()
     assert settings.resource == expected
 
@@ -169,8 +293,8 @@ def test_resource_root_path_is_canonicalised(clean_env, given, expected):
 def test_http_issuer_warns_outside_dev_mode(clean_env, caplog):
     """Bearer tokens over http:// travel in cleartext. Legitimate locally, loud anyway."""
     clean_env.setenv("MCP_AUTH_MODE", "authplane")
-    clean_env.setenv("AUTHPLANE_ISSUER", "http://auth.example.com")
-    clean_env.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    clean_env.setenv("MCP_OAUTH_ISSUER", "http://auth.example.com")
+    clean_env.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     with caplog.at_level("WARNING"):
         AuthSettings.from_env()
     assert any("http://" in r.message or "unencrypted" in r.message for r in caplog.records)
@@ -353,8 +477,8 @@ async def test_stdio_transport_ignores_auth_configuration(monkeypatch):
 
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://127.0.0.1:9")  # would fail if consulted
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://127.0.0.1:9")  # would fail if consulted
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     # No read-only account configured, so the startup read-path check reports
     # the posture and returns without touching MySQL. Cleared explicitly rather
     # than inherited: this test is about transport dispatch, and an ambient
@@ -540,8 +664,8 @@ async def test_a_half_configured_auth_env_does_not_break_the_read_path_check(mon
 
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
     monkeypatch.delenv("MCP_AUTH_MODE", raising=False)
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://127.0.0.1:9")
-    monkeypatch.delenv("AUTHPLANE_RESOURCE", raising=False)
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://127.0.0.1:9")
+    monkeypatch.delenv("MCP_OAUTH_RESOURCE", raising=False)
     monkeypatch.delenv("MYSQL_RO_USER", raising=False)
 
     started = []

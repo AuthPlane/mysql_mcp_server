@@ -274,8 +274,8 @@ def test_revocation_is_off_by_default_and_that_is_a_documented_trade_off(monkeyp
     up to an hour with default lifetimes.
     """
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.delenv("MCP_AUTH_REVOCATION_CHECK", raising=False)
 
     settings = AuthSettings.from_env()
@@ -289,23 +289,23 @@ def test_revocation_requires_client_credentials(monkeypatch):
     every request -- a total outage. Better to refuse at startup.
     """
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.setenv("MCP_AUTH_REVOCATION_CHECK", "true")
-    monkeypatch.delenv("AUTHPLANE_CLIENT_ID", raising=False)
-    monkeypatch.delenv("AUTHPLANE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MCP_OAUTH_CLIENT_SECRET", raising=False)
 
-    with pytest.raises(VerifierConfigError, match="AUTHPLANE_CLIENT_ID"):
+    with pytest.raises(VerifierConfigError, match="MCP_OAUTH_CLIENT_ID"):
         AuthSettings.from_env()
 
 
 def test_revocation_enabled_with_credentials_is_accepted(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.setenv("MCP_AUTH_REVOCATION_CHECK", "true")
-    monkeypatch.setenv("AUTHPLANE_CLIENT_ID", "cid")
-    monkeypatch.setenv("AUTHPLANE_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("MCP_OAUTH_CLIENT_SECRET", "csecret")
 
     settings = AuthSettings.from_env()
     assert settings.revocation_check is True
@@ -321,9 +321,9 @@ def test_clock_skew_defaults_to_a_small_tolerance(monkeypatch):
     """Zero tolerance would reject valid tokens whenever clocks drift, which they
     always do; a large tolerance keeps expired tokens alive for that long."""
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
-    monkeypatch.delenv("AUTHPLANE_CLOCK_SKEW_SECONDS", raising=False)
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    monkeypatch.delenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", raising=False)
 
     assert AuthSettings.from_env().clock_skew_seconds == 30
 
@@ -331,9 +331,9 @@ def test_clock_skew_defaults_to_a_small_tolerance(monkeypatch):
 @pytest.mark.parametrize("value", ["not-a-number", "-1", "1.5"])
 def test_invalid_clock_skew_is_rejected_at_startup(monkeypatch, value):
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
-    monkeypatch.setenv("AUTHPLANE_CLOCK_SKEW_SECONDS", value)
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", value)
 
     with pytest.raises(VerifierConfigError):
         AuthSettings.from_env()
@@ -343,9 +343,9 @@ def test_large_clock_skew_is_allowed_but_warned_about(monkeypatch, caplog):
     """It is a legitimate choice on badly-synchronised infrastructure, and it
     widens the window in which an expired token still works -- so it is loud."""
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
-    monkeypatch.setenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "600")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", "600")
 
     with caplog.at_level("WARNING"):
         settings = AuthSettings.from_env()

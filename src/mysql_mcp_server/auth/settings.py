@@ -1,8 +1,15 @@
 """Environment-driven auth configuration.
 
-``MCP_AUTH_MODE`` is this repo's own on/off switch and stays in the existing
-``MCP_*`` namespace. Everything else uses the names the Authplane SDK
-documents, so an operator following those docs finds what they expect.
+Every variable lives in this repo's own ``MCP_*`` namespace: ``MCP_AUTH_MODE``
+is the on/off switch, and the OAuth parameters an authorization server dictates
+are ``MCP_OAUTH_*``. None of those values are provider-specific -- an issuer, a
+resource identifier, a signing algorithm and a clock skew are what *any* OAuth
+2.1 server hands an operator -- so no provider's name belongs on them.
+
+The ``AUTHPLANE_*`` spellings these names carried during development are still
+read as fallbacks, each warning and naming its replacement, so a deployment
+configured against a pre-release checkout keeps booting. Authplane remains the
+shipped backend, named once in ``build_verifier`` rather than on every setting.
 """
 
 from __future__ import annotations
@@ -17,12 +24,77 @@ from .protocol import VerifierConfigError
 logger = logging.getLogger(__name__)
 
 _OFF_VALUES = ("", "none", "off", "false", "0")
-KNOWN_MODES = ("authplane",)
+
+# The documented mode name. It says what the mode *is* -- an OAuth 2.1
+# protected resource -- rather than which backend implements it, so an operator
+# reading it learns the protocol they are turning on.
+CANONICAL_MODE = "oauth"
+KNOWN_MODES = (CANONICAL_MODE,)
+
+# ``authplane`` was the spelling used during development, from when the only
+# backend was also the mode name. Still accepted: it costs one dict entry, and
+# the mode is the single value deciding whether this server requires
+# authentication at all -- refusing to boot on it would take a protected
+# deployment down, and the operator's fastest way back up is a value that boots,
+# which may well be ``none``.
+_MODE_ALIASES = {"authplane": CANONICAL_MODE}
 
 # Default scope names. Both are configurable because a deployment with an
 # existing scope taxonomy should not have to adopt ours.
 DEFAULT_READ_SCOPE = "mysql:read"
 DEFAULT_WRITE_SCOPE = "mysql:write"
+
+
+# Keys are the documented names, values the provider-prefixed spelling each
+# carried during development; both are read, the documented one winning. Kept
+# rather than dropped once the names settled, because the cost of the table is
+# this dict and the cost of dropping it is a deployment configured against a
+# pre-release checkout that stops booting with no hint why.
+RENAMED_ENV_VARS = {
+    "MCP_OAUTH_ISSUER": "AUTHPLANE_ISSUER",
+    "MCP_OAUTH_RESOURCE": "AUTHPLANE_RESOURCE",
+    "MCP_OAUTH_SCOPES": "AUTHPLANE_SCOPES",
+    "MCP_OAUTH_CLIENT_ID": "AUTHPLANE_CLIENT_ID",
+    "MCP_OAUTH_CLIENT_SECRET": "AUTHPLANE_CLIENT_SECRET",
+    "MCP_OAUTH_DEV_MODE": "AUTHPLANE_DEV_MODE",
+    "MCP_OAUTH_ALLOWED_ALGORITHMS": "AUTHPLANE_ALLOWED_ALGORITHMS",
+    "MCP_OAUTH_CLOCK_SKEW_SECONDS": "AUTHPLANE_CLOCK_SKEW_SECONDS",
+    "MCP_OAUTH_REALM": "AUTHPLANE_REALM",
+}
+
+
+def _raw(name: str) -> str | None:
+    """Raw value for ``name``, falling back to the spelling it replaced.
+
+    A blank counts as unset for the purpose of the fallback. An operator moving
+    to the documented names has both spellings in the environment -- the new one
+    empty from a fresh ``.env.example``, the old one carrying the real value --
+    and treating the blank as an answer would fail a boot whose configuration is
+    sitting right there. Names with no alternative spelling read exactly as
+    ``os.getenv``.
+    """
+    raw = os.getenv(name)
+    if raw is not None and raw.strip() != "":
+        return raw
+    legacy = RENAMED_ENV_VARS.get(name)
+    if legacy is None:
+        return raw
+    legacy_raw = os.getenv(legacy)
+    if legacy_raw is None or legacy_raw.strip() == "":
+        return raw
+    logger.warning(
+        "%s has been renamed to %s and is still honoured; the value and its "
+        "meaning are unchanged. Rename it to stop seeing this.",
+        legacy,
+        name,
+    )
+    return legacy_raw
+
+
+def _env(name: str, default: str = "") -> str:
+    """``os.getenv`` semantics over ``_raw``: a set-but-empty value is the answer."""
+    raw = _raw(name)
+    return default if raw is None else raw
 
 
 def auth_enabled_in_env() -> bool:
@@ -31,7 +103,7 @@ def auth_enabled_in_env() -> bool:
     ``AuthSettings.from_env()`` raises on a half-configured auth setup, which is
     the right behaviour where auth is about to be wired up -- but the startup
     read-path check only needs the yes/no, and must not turn "auth is off" into
-    an exception for an operator running stdio with a stray AUTHPLANE_* variable
+    an exception for an operator running stdio with a stray MCP_OAUTH_* variable
     exported. Reads the one variable that decides it and nothing else.
     """
     return os.getenv("MCP_AUTH_MODE", "none").strip().lower() not in _OFF_VALUES
@@ -57,7 +129,7 @@ def canonical_resource(raw: str) -> str:
     is part of the path rather than an artefact of an empty one, and
     ``http://host/mcp`` and ``http://host/mcp/`` name different resources.
 
-    Not applied to ``AUTHPLANE_ISSUER``: the ``iss`` claim's source of truth is
+    Not applied to ``MCP_OAUTH_ISSUER``: the ``iss`` claim's source of truth is
     whatever the authorization server itself puts in the token, which by
     Authplane's own convention is the bare origin with no trailing slash --
     adding one here would create the same mismatch this fixes, against the
@@ -105,15 +177,20 @@ class AuthSettings:
     unavailable_retry_after: int = 5
 
     def __post_init__(self) -> None:
-        """Canonicalise the resource URI on *every* construction path.
+        """Canonicalise the resource URI and the mode on *every* construction path.
 
         ``from_env`` is not the only way settings are built: anything that
         constructs them by hand -- the test harness, an embedding application --
         has the same need, and settings that disagreed with the running server
         about what the audience is would be exactly the kind of mismatch
         ``canonical_resource`` exists to prevent.
+
+        The mode is folded through ``_MODE_ALIASES`` here for the same reason,
+        so ``build_verifier`` dispatches on one spelling however the settings
+        were built.
         """
         object.__setattr__(self, "resource", canonical_resource(self.resource))
+        object.__setattr__(self, "mode", _MODE_ALIASES.get(self.mode, self.mode))
 
     @property
     def effective_dpop_algorithms(self) -> tuple[str, ...]:
@@ -131,34 +208,35 @@ class AuthSettings:
         mode = os.getenv("MCP_AUTH_MODE", "none").strip().lower()
         if mode in _OFF_VALUES:
             return cls(enabled=False)
+        mode = _MODE_ALIASES.get(mode, mode)
         if mode not in KNOWN_MODES:
             raise VerifierConfigError(
                 f"MCP_AUTH_MODE={mode!r} is not recognised. "
                 f"Supported: {', '.join(KNOWN_MODES)}, or 'none' to disable."
             )
 
-        issuer = os.getenv("AUTHPLANE_ISSUER", "").strip().rstrip("/")
-        resource = canonical_resource(os.getenv("AUTHPLANE_RESOURCE", "").strip())
+        issuer = _env("MCP_OAUTH_ISSUER", "").strip().rstrip("/")
+        resource = canonical_resource(_env("MCP_OAUTH_RESOURCE", "").strip())
         missing = [
             name
             for name, value in (
-                ("AUTHPLANE_ISSUER", issuer),
-                ("AUTHPLANE_RESOURCE", resource),
+                ("MCP_OAUTH_ISSUER", issuer),
+                ("MCP_OAUTH_RESOURCE", resource),
             )
             if not value
         ]
         if missing:
             raise VerifierConfigError(
                 f"MCP_AUTH_MODE={mode} requires {' and '.join(missing)}. "
-                "AUTHPLANE_ISSUER is the authorization server's base URL "
-                "(e.g. http://localhost:9000). AUTHPLANE_RESOURCE is this server's "
+                "MCP_OAUTH_ISSUER is the authorization server's base URL "
+                "(e.g. http://localhost:9000). MCP_OAUTH_RESOURCE is this server's "
                 "canonical URI and must equal the token's 'aud' claim byte-for-byte."
             )
 
-        dev_mode = _flag("AUTHPLANE_DEV_MODE", False)
+        dev_mode = _flag("MCP_OAUTH_DEV_MODE", False)
         if issuer.startswith("http://") and not dev_mode:
             logger.warning(
-                "AUTHPLANE_ISSUER uses http:// (%s). Bearer tokens and JWKS travel "
+                "MCP_OAUTH_ISSUER uses http:// (%s). Bearer tokens and JWKS travel "
                 "unencrypted; use https:// outside local development.",
                 issuer,
             )
@@ -175,7 +253,7 @@ class AuthSettings:
                 "Identical values collapse the read/write split into no split at all."
             )
 
-        declared = os.getenv("AUTHPLANE_SCOPES", "")
+        declared = _env("MCP_OAUTH_SCOPES", "")
         scopes = tuple(s.strip() for s in declared.split(",") if s.strip())
         if not scopes:
             # Advertise what this server actually uses rather than nothing.
@@ -183,11 +261,11 @@ class AuthSettings:
 
         algorithms = tuple(
             a.strip()
-            for a in os.getenv("AUTHPLANE_ALLOWED_ALGORITHMS", "ES256,RS256").split(",")
+            for a in _env("MCP_OAUTH_ALLOWED_ALGORITHMS", "ES256,RS256").split(",")
             if a.strip()
         )
         if not algorithms:
-            raise VerifierConfigError("AUTHPLANE_ALLOWED_ALGORITHMS resolved to an empty list.")
+            raise VerifierConfigError("MCP_OAUTH_ALLOWED_ALGORITHMS resolved to an empty list.")
         if any(a.lower() == "none" for a in algorithms):
             # 'alg: none' means unsigned: anyone can mint a token for any subject.
             raise VerifierConfigError("Algorithm 'none' is never acceptable for access tokens.")
@@ -214,14 +292,14 @@ class AuthSettings:
             proof_algorithms = algorithms
 
         try:
-            skew = int(os.getenv("AUTHPLANE_CLOCK_SKEW_SECONDS", "30"))
+            skew = int(_env("MCP_OAUTH_CLOCK_SKEW_SECONDS", "30"))
         except ValueError as exc:
-            raise VerifierConfigError("AUTHPLANE_CLOCK_SKEW_SECONDS must be an integer.") from exc
+            raise VerifierConfigError("MCP_OAUTH_CLOCK_SKEW_SECONDS must be an integer.") from exc
         if skew < 0:
-            raise VerifierConfigError("AUTHPLANE_CLOCK_SKEW_SECONDS must not be negative.")
+            raise VerifierConfigError("MCP_OAUTH_CLOCK_SKEW_SECONDS must not be negative.")
         if skew > 300:
             logger.warning(
-                "AUTHPLANE_CLOCK_SKEW_SECONDS=%d is large; it widens the window in which "
+                "MCP_OAUTH_CLOCK_SKEW_SECONDS=%d is large; it widens the window in which "
                 "an expired token is still accepted.",
                 skew,
             )
@@ -235,15 +313,15 @@ class AuthSettings:
         # cost of a network round trip per request and a hard dependency on the
         # AS being reachable.
         revocation_check = _flag("MCP_AUTH_REVOCATION_CHECK", False)
-        client_id = os.getenv("AUTHPLANE_CLIENT_ID", "").strip()
-        client_secret = os.getenv("AUTHPLANE_CLIENT_SECRET", "").strip()
+        client_id = _env("MCP_OAUTH_CLIENT_ID", "").strip()
+        client_secret = _env("MCP_OAUTH_CLIENT_SECRET", "").strip()
         if revocation_check and not (client_id and client_secret):
             # The introspection endpoint does not accept unauthenticated callers,
             # so without credentials every check would fail -- and with
             # fail-closed semantics that means rejecting every request.
             raise VerifierConfigError(
-                "MCP_AUTH_REVOCATION_CHECK=true requires AUTHPLANE_CLIENT_ID and "
-                "AUTHPLANE_CLIENT_SECRET: this server must authenticate to the "
+                "MCP_AUTH_REVOCATION_CHECK=true requires MCP_OAUTH_CLIENT_ID and "
+                "MCP_OAUTH_CLIENT_SECRET: this server must authenticate to the "
                 "authorization server's introspection endpoint."
             )
         if not revocation_check:
@@ -325,12 +403,12 @@ class AuthSettings:
             dpop_algorithms=proof_algorithms,
             clock_skew_seconds=skew,
             dev_mode=dev_mode,
-            realm=os.getenv("AUTHPLANE_REALM", "mysql_mcp_server").strip() or "mysql_mcp_server",
+            realm=_env("MCP_OAUTH_REALM", "mysql_mcp_server").strip() or "mysql_mcp_server",
         )
 
 
 def _flag(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+    raw = _raw(name)
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")

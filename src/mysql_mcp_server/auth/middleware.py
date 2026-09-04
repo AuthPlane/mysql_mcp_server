@@ -61,7 +61,7 @@ def prm_path_for(metadata_url: str) -> str:
     Derived from the verifier's own `metadata_url()` rather than assumed,
     because that URL is what a 401 sends clients to. Registering the route at a
     fixed `PRM_PATH` while the challenge pointed at the RFC 9728 §3 suffix form
-    meant that with `AUTHPLANE_RESOURCE=https://host/mysql` the challenge named
+    meant that with `MCP_OAUTH_RESOURCE=https://host/mysql` the challenge named
     `/.well-known/oauth-protected-resource/mysql`, which no route served:
     discovery 404'd with nothing in the log to explain it. Invisible at the root,
     which is every deployment we had run.

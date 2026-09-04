@@ -22,7 +22,7 @@ from .protocol import (
     VerifierConfigError,
     VerifierUnavailableError,
 )
-from .settings import AuthSettings
+from .settings import CANONICAL_MODE, AuthSettings
 
 __all__ = [
     "PRM_PATH",
@@ -43,11 +43,17 @@ __all__ = [
 async def build_verifier(settings: AuthSettings) -> TokenVerifier:
     """Construct the verifier for ``settings.mode``.
 
-    The single place a mode name maps to an implementation. Adding a backend
+    The single place a mode name maps to an implementation, and the only place
+    in the configuration path that names a provider at all. Adding a backend
     means adding a branch here and a class satisfying ``TokenVerifier``;
     nothing in ``middleware.py`` changes.
+
+    ``MCP_AUTH_MODE=oauth`` selects Authplane because it is the backend that
+    ships, not because the mode means Authplane. A second backend would be
+    chosen here -- by a new mode value, or by discovery against the configured
+    issuer -- without touching a single operator-facing variable.
     """
-    if settings.mode == "authplane":
+    if settings.mode == CANONICAL_MODE:
         from .authplane import AuthplaneVerifier
 
         return await AuthplaneVerifier.create(settings)

@@ -1013,7 +1013,7 @@ async def _run_sse_server():
 
         # Serve the document at the path the 401 challenge actually names.
         # RFC 9728 §3 puts a resource's own path *after* the well-known segment,
-        # so a non-root AUTHPLANE_RESOURCE moves this route; hard-coding the root
+        # so a non-root MCP_OAUTH_RESOURCE moves this route; hard-coding the root
         # form made discovery 404 for exactly those deployments.
         prm_route_path = prm_path_for(verifier.metadata_url())
         routes.append(Route(prm_route_path, endpoint=protected_resource_metadata))

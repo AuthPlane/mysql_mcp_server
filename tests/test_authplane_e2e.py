@@ -118,7 +118,7 @@ def running_server(log_path, port: int, dpop: str):
     Starlette application and the uvicorn config together, so there is no factory
     to import, and running it for real is closer to what is deployed anyway.
 
-    `AUTHPLANE_RESOURCE` stays fixed while the port varies. That is not a
+    `MCP_OAUTH_RESOURCE` stays fixed while the port varies. That is not a
     mismatch: the resource URI is what tokens carry in `aud` and what DPoP proofs
     are signed for, and the server deliberately derives both from configuration
     rather than from the socket or the `Host` header. Varying the port is the
@@ -138,9 +138,9 @@ def running_server(log_path, port: int, dpop: str):
         "MCP_SSE_HOST": "127.0.0.1",
         "MCP_SSE_PORT": str(port),
         "MCP_AUTH_MODE": "authplane",
-        "AUTHPLANE_ISSUER": ISSUER,
-        "AUTHPLANE_RESOURCE": RESOURCE_AUD,
-        "AUTHPLANE_DEV_MODE": "true",
+        "MCP_OAUTH_ISSUER": ISSUER,
+        "MCP_OAUTH_RESOURCE": RESOURCE_AUD,
+        "MCP_OAUTH_DEV_MODE": "true",
         "MCP_AUTH_DPOP": dpop,
         # Pinned, not inherited. The server calls `load_dotenv()`, which does not
         # override variables already set here but does supply any that are
@@ -505,7 +505,7 @@ async def test_a_dpop_bound_token_works_end_to_end(server, live):
     """A sender-constrained token driving a real MCP session.
 
     Note the two different hosts. The connection is made to `127.0.0.1`, but each
-    proof is signed for `AUTHPLANE_RESOURCE`, because the server builds the URL it
+    proof is signed for `MCP_OAUTH_RESOURCE`, because the server builds the URL it
     checks a proof against from the *configured* resource, never from the
     caller-controlled `Host` header. That is deliberate: otherwise a caller could
     choose what their own proof has to match. It also means this test exercises

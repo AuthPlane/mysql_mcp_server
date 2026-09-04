@@ -413,8 +413,8 @@ def test_throttling_is_off_by_default(monkeypatch):
     lock everyone out together.
     """
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.delenv("MCP_AUTH_MAX_AUTH_FAILURES", raising=False)
 
     settings = AuthSettings.from_env()
@@ -425,8 +425,8 @@ def test_throttling_is_off_by_default(monkeypatch):
 @pytest.mark.parametrize("value", ["-1", "not-a-number"])
 def test_invalid_throttle_settings_fail_at_startup(monkeypatch, value):
     monkeypatch.setenv("MCP_AUTH_MODE", "authplane")
-    monkeypatch.setenv("AUTHPLANE_ISSUER", "http://localhost:9000")
-    monkeypatch.setenv("AUTHPLANE_RESOURCE", "http://localhost:8000")
+    monkeypatch.setenv("MCP_OAUTH_ISSUER", "http://localhost:9000")
+    monkeypatch.setenv("MCP_OAUTH_RESOURCE", "http://localhost:8000")
     monkeypatch.setenv("MCP_AUTH_MAX_AUTH_FAILURES", value)
 
     with pytest.raises(VerifierConfigError):

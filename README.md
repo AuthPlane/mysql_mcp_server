@@ -81,22 +81,22 @@ MYSQL_RO_PASSWORD=       # account, so MySQL refuses writes regardless of this s
 MYSQL_MAX_ROWS=1000      # Cap on rows returned per result set (0 disables)
 MYSQL_STATEMENT_TIMEOUT_MS=30000  # Server-side limit on read statements (0 disables)
 
-# OAuth 2.1 Authentication via Authplane (Optional, SSE only)
+# OAuth 2.1 Authentication (Optional, SSE only)
 # Requires: pip install mysql_mcp_server[auth]   —   full reference: AUTHENTICATION.md
-MCP_AUTH_MODE=none                # 'authplane' to enable; 'none' (default) changes nothing
-AUTHPLANE_ISSUER=                 # Authplane base URL, e.g. http://localhost:9000
-AUTHPLANE_RESOURCE=               # This server's canonical URI; must equal the token's 'aud'
+MCP_AUTH_MODE=none                # 'oauth' to enable; 'none' (default) changes nothing
+MCP_OAUTH_ISSUER=                 # Authorization server base URL, e.g. http://localhost:9000
+MCP_OAUTH_RESOURCE=               # This server's canonical URI; must equal the token's 'aud'
 MYSQL_SCOPE_READ=mysql:read       # Scope required by the read tools
 MYSQL_SCOPE_WRITE=mysql:write     # Scope that routes execute_sql to the read-write account
 MCP_AUTH_BIND_SESSION=true        # Bind each SSE session to the subject that opened it
 MCP_AUTH_AUDIT=true               # Structured audit records (see Auditing below)
 MCP_AUTH_DPOP=off                 # off | optional | required (RFC 9449 sender-constrained tokens)
 MCP_AUTH_REVOCATION_CHECK=false   # Check revocation per request; needs the two values below
-AUTHPLANE_CLIENT_ID=              # This server's client id, for introspection calls
-AUTHPLANE_CLIENT_SECRET=          #
+MCP_OAUTH_CLIENT_ID=              # This server's client id, for introspection calls
+MCP_OAUTH_CLIENT_SECRET=          #
 MCP_AUTH_MAX_AUTH_FAILURES=0      # Throttle a client after N auth failures (0 disables)
-AUTHPLANE_CLOCK_SKEW_SECONDS=30   # Tolerance for clock drift between this server and the AS
-AUTHPLANE_ALLOWED_ALGORITHMS=ES256,RS256
+MCP_OAUTH_CLOCK_SKEW_SECONDS=30   # Tolerance for clock drift between this server and the AS
+MCP_OAUTH_ALLOWED_ALGORITHMS=ES256,RS256
 
 # SSH Tunneling (Optional)
 MYSQL_SSH_ENABLE=false   # Set to true to enable
@@ -291,9 +291,9 @@ It is optional and off by default. With `MCP_AUTH_MODE` unset the server behaves
 pip install mysql_mcp_server[auth]
 
 export MCP_TRANSPORT=sse
-export MCP_AUTH_MODE=authplane
-export AUTHPLANE_ISSUER=https://auth.example.com     # your Authplane server
-export AUTHPLANE_RESOURCE=https://mcp.example.com    # this server's canonical URI
+export MCP_AUTH_MODE=oauth
+export MCP_OAUTH_ISSUER=https://auth.example.com     # your Authplane server
+export MCP_OAUTH_RESOURCE=https://mcp.example.com    # this server's canonical URI
 export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...    # see Read/write separation
 python -m mysql_mcp_server
 ```
