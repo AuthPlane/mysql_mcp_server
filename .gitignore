@@ -15,6 +15,13 @@ Scripts/
 # Development environment
 .python-version
 
+# Local configuration. .env.example is the template that is tracked; .env is the
+# filled-in copy, and it holds the database password and the client secret.
+.env
+
+# Audit trail written by MCP_AUTH_AUDIT_FILE
+*.jsonl
+
 # IDE settings (optional)
 .vscode/
 .idea/

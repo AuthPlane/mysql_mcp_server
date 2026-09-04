@@ -4,3 +4,8 @@ pytest-cov>=4.1.0
 black>=24.0.0
 isort>=5.12.0
 mypy>=1.0.0
+httpx>=0.27.0
+# Imported directly by tests/authplane_harness.py to generate DPoP signing keys.
+# It arrives transitively via authplane-sdk today; declared so the live tests do
+# not break if that chain changes.
+cryptography>=42.0.0

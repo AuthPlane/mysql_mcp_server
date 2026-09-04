@@ -75,6 +75,29 @@ MCP_SSE_HOST=0.0.0.0     # Listen on all interfaces (required for Docker/hosting
 PORT=8000                # HTTP port (fallback for MCP_SSE_PORT)
 MCP_SSE_ALLOWED_HOSTS=   # Comma-separated allowed Host headers (default: localhost:{port},127.0.0.1:{port})
 
+# Read/Write Separation (Optional, recommended when using SSE)
+MYSQL_RO_USER=           # A MySQL account with SELECT only. Read tools connect as this
+MYSQL_RO_PASSWORD=       # account, so MySQL refuses writes regardless of this server
+MYSQL_MAX_ROWS=1000      # Cap on rows returned per result set (0 disables)
+MYSQL_STATEMENT_TIMEOUT_MS=30000  # Server-side limit on read statements (0 disables)
+
+# OAuth 2.1 Authentication (Optional, SSE only)
+# Requires: pip install mysql_mcp_server[auth]   —   full reference: AUTHENTICATION.md
+MCP_AUTH_MODE=none                # 'oauth' to enable; 'none' (default) changes nothing
+MCP_OAUTH_ISSUER=                 # Authorization server base URL, e.g. http://localhost:9000
+MCP_OAUTH_RESOURCE=               # This server's canonical URI; must equal the token's 'aud'
+MYSQL_SCOPE_READ=mysql:read       # Scope required by the read tools
+MYSQL_SCOPE_WRITE=mysql:write     # Scope that routes execute_sql to the read-write account
+MCP_AUTH_BIND_SESSION=true        # Bind each SSE session to the subject that opened it
+MCP_AUTH_AUDIT=true               # Structured audit records (see Auditing below)
+MCP_AUTH_DPOP=off                 # off | optional | required (RFC 9449 sender-constrained tokens)
+MCP_AUTH_REVOCATION_CHECK=false   # Check revocation per request; needs the two values below
+MCP_OAUTH_CLIENT_ID=              # This server's client id, for introspection calls
+MCP_OAUTH_CLIENT_SECRET=          #
+MCP_AUTH_MAX_AUTH_FAILURES=0      # Throttle a client after N auth failures (0 disables)
+MCP_OAUTH_CLOCK_SKEW_SECONDS=30   # Tolerance for clock drift between this server and the AS
+MCP_OAUTH_ALLOWED_ALGORITHMS=ES256,RS256
+
 # SSH Tunneling (Optional)
 MYSQL_SSH_ENABLE=false   # Set to true to enable
 MYSQL_SSH_HOST=          # SSH jump host
@@ -107,9 +130,10 @@ When `MYSQL_DATABASE` is not set, the server operates in multi-database mode:
 ## Available Tools
 
 ### `execute_sql`
-Executes any standard SQL query.
+Executes any single SQL statement, read or write. **The privileges it runs with follow the caller's scope:** a caller holding only `MYSQL_SCOPE_READ` reaches the database as the read-only account, so a write is refused by MySQL itself.
 - **Arguments:** `query` (string)
-- **Features:** Supports `SELECT`, `SHOW`, `DESCRIBE`, and DML (`INSERT`, `UPDATE`, `DELETE`). DML operations are marked with a destructive hint.
+- **Authorization:** write scope → read-write connection; read scope only → `SELECT`-only connection; neither → refused before the database is reached. With authentication disabled (including stdio) it keeps the read-write connection, as before.
+- **No statement inspection.** The server does not parse your SQL to decide what it is. The connection's MySQL privileges decide, and MySQL enforces them — which also covers stacked writes and version-gated comments such as `/*!DROP TABLE t*/`, the syntax classifiers are weakest against.
 - **Limitation:** Single statements only. Multi-statement queries are not supported.
 - **Cross-database:** Use `database.table` notation to query any database regardless of the `MYSQL_DATABASE` setting.
 
@@ -233,7 +257,9 @@ pytest
 - **Encrypted Access:** Full support for SSL/TLS and SSH Tunneling for secure remote connections.
 - **Log Privacy:** Passwords and SSH private keys are automatically masked in server logs.
 - **Least Privilege:** Always use a dedicated MySQL user with minimal required permissions.
-- **SSE transport has no built-in authentication.** The SSE server binds to `0.0.0.0` by default and accepts connections without credentials. If you expose it beyond localhost, place it behind a reverse proxy (nginx, Caddy, Traefik) that enforces authentication. Example with nginx and HTTP Basic Auth:
+- **SSE transport is unauthenticated by default.** With `MCP_AUTH_MODE` unset the SSE server binds to `0.0.0.0` and accepts connections without credentials. Two ways to close that:
+  - **OAuth 2.1 (recommended if your client supports it):** see [OAuth 2.1 authentication](#oauth-21-authentication-sse) below. Unlike a proxy, this passes the caller's identity to the server, which is what makes per-tool authorization and a per-user audit trail possible.
+  - **A reverse proxy**, if you only need to keep strangers out. Example with nginx and HTTP Basic Auth:
 
   ```nginx
   location /sse {
@@ -254,6 +280,49 @@ pytest
   Set `MCP_SSE_HOST=127.0.0.1` so the server only listens on loopback and the proxy is the sole public entry point. Set `MCP_SSE_ALLOWED_HOSTS` to the public hostname your proxy forwards (e.g. `MCP_SSE_ALLOWED_HOSTS=myserver.example.com:443`).
 
 See [SECURITY.md](SECURITY.md) for a comprehensive guide on securing your deployment.
+
+## OAuth 2.1 authentication (SSE)
+
+The SSE transport can require an OAuth 2.1 access token, using [Authplane](https://authplane.com) as the authorization server via the official [Authplane Python SDK](https://pypi.org/project/authplane-sdk/) (`authplane-sdk`).
+
+It is optional and off by default. With `MCP_AUTH_MODE` unset the server behaves exactly as it did before this feature existed: no middleware, no extra routes, and the SDK is never imported.
+
+```bash
+pip install mysql_mcp_server[auth]
+
+export MCP_TRANSPORT=sse
+export MCP_AUTH_MODE=oauth
+export MCP_OAUTH_ISSUER=https://auth.example.com     # your Authplane server
+export MCP_OAUTH_RESOURCE=https://mcp.example.com    # this server's canonical URI
+export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...    # see Read/write separation
+python -m mysql_mcp_server
+```
+
+Both MCP endpoints are protected: `GET /sse`, which issues the session id, and `POST /messages/`, which carries every tool call. The health probe `/` and the RFC 9728 metadata document at `/.well-known/oauth-protected-resource` stay public, since a client cannot obtain a token without first discovering where tokens come from.
+
+Tokens are accepted only in the `Authorization` header. `get_schema_info` and `get_table_sample` require `MYSQL_SCOPE_READ`, as do MCP resource reads. `execute_sql` is authorized differently — the caller's scope selects the database account, so the grants on that account decide the outcome, and a caller holding neither scope is refused. DPoP (RFC 9449) and per-request revocation checks are supported and ship disabled.
+
+📖 **See [AUTHENTICATION.md](AUTHENTICATION.md)** for how it works, which SDK calls are used and where, the full configuration reference, and the known limits.
+
+## Read/write separation
+
+The read/write boundary is **MySQL's privilege system**, not this server. Nothing in the process parses your SQL to decide whether it writes; the caller's scope picks which MySQL account runs the statement, and that account's grants decide the outcome. Create the read-only account:
+
+```sql
+CREATE USER 'mcp_ro'@'%' IDENTIFIED BY 'a-strong-password';
+GRANT SELECT ON your_database.* TO 'mcp_ro'@'%';
+```
+
+```bash
+export MYSQL_RO_USER=mcp_ro
+export MYSQL_RO_PASSWORD=a-strong-password
+```
+
+A read-scoped caller then connects as that account, so a write is refused by MySQL — including DDL, stacked statements, and anything smuggled through a version-gated comment. The grants are checked at startup and **the server refuses to start if that account can write**, a misconfiguration that would otherwise look identical to a correct setup.
+
+There is no software fallback, because none of the alternatives is a boundary. Measured against MySQL 8.4, wrapping reads in `START TRANSACTION READ ONLY` refuses `INSERT`/`UPDATE`/`DELETE` but lets `CREATE`, `DROP`, `ALTER`, `TRUNCATE` and `RENAME` through, because DDL commits implicitly and ends the transaction — it would look like a boundary without being one. The account's grants are the boundary.
+
+**Without `MYSQL_RO_USER`,** a read-scoped caller runs on the read-write account and the read scope has nothing enforcing it: a `DROP DATABASE` from a read-only token would succeed. This is permitted so that enabling authentication does not require provisioning a database account first, but with authentication on the server warns about it at startup, warns once when it first happens, and audits every such call as `read_scope_not_enforced`. With authentication off there is no scope to enforce and no warning is emitted.
 
 ## Security Best Practices
 This MCP implementation requires database access to function. For security:
