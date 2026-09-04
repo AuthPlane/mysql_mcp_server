@@ -36,10 +36,13 @@ What a ``SELECT``-only grant still permits was checked too:
 is refused (1227), and ``SELECT ... FOR UPDATE`` is refused (1142). ``SLEEP()``,
 ``BENCHMARK()`` and ``GET_LOCK()`` all run — resource consumption rather than a
 privilege violation, and bounded by ``MYSQL_STATEMENT_TIMEOUT_MS`` and
-``MYSQL_MAX_ROWS`` rather than by parsing. ``GET_LOCK()`` is the one that escapes
-that bound: the timeout cuts the other two short and limits how long a caller
-blocks waiting on a held lock (3024), but the lock itself lives until it is
-released or the session ends.
+``MYSQL_MAX_ROWS`` rather than by parsing. ``GET_LOCK()`` is bounded by something
+else: a named lock belongs to the MySQL session rather than to the statement, so
+the timeout does not release it (it only caps how long a *waiting* caller blocks,
+3024). What releases it is ``run_query`` opening its own connection per call and
+closing it on return. A pooled or long-lived connection would let a read-scoped
+caller hold a named lock and stall any writer coordinating on that name, so that
+per-call connection is a security property, not just a simplification.
 
 What remains here is the translation layer: recognising a refusal *as* a refusal
 so it reaches the caller as a policy answer instead of an opaque database fault.

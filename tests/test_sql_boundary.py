@@ -170,6 +170,44 @@ def test_database_refuses_load_file():
         assert is_denial(exc)
 
 
+# --------------------------------------------------------------------------
+# Resource consumption a SELECT-only grant still permits, and what bounds it.
+#
+# SLEEP(), BENCHMARK() and GET_LOCK() all run -- they consume rather than
+# violate a privilege, so no grant refuses them. SLEEP and BENCHMARK are bounded
+# by MYSQL_STATEMENT_TIMEOUT_MS because the consumption *is* the statement.
+#
+# GET_LOCK is not: a named lock belongs to the MySQL session, so the statement
+# timeout cannot release it. What releases it is `run_query` opening its own
+# connection per call and closing it on return -- the shape `run_as_readonly`
+# reproduces. That makes the per-call connection a security property, and this
+# is the test that says so: a pooled or long-lived connection would let a
+# read-scoped caller hold a named lock and stall any writer coordinating on it.
+# --------------------------------------------------------------------------
+
+def test_a_named_lock_does_not_outlive_the_call_that_took_it():
+    """The lock must be gone once the statement's connection closes."""
+    lock = "boundary_probe_lock"
+
+    assert run_as_readonly(f"SELECT GET_LOCK('{lock}', 5)") is None, (
+        "GET_LOCK is not a privilege violation; a SELECT-only account can call it"
+    )
+
+    # Observe from a connection that did not take the lock. IS_USED_LOCK returns
+    # the holder's connection id, or NULL when nobody holds it.
+    with connect(**_config(read_only=True)) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT IS_USED_LOCK('{lock}')")
+            holder = cursor.fetchone()[0]
+
+    assert holder is None, (
+        f"'{lock}' is still held by connection {holder} after the call that took "
+        "it returned. A read-scoped caller can now stall any writer coordinating "
+        "on that name -- check that run_query still opens and closes its own "
+        "connection per call rather than reusing a pooled one."
+    )
+
+
 def test_readonly_account_holds_no_forbidden_privileges():
     """Assert the grant set directly, so a misconfigured account fails loudly.
 

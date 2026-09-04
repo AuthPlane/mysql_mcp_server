@@ -291,11 +291,18 @@ What a `SELECT`-only grant still permits was checked too: `LOAD_FILE()` returns
 `NULL` without the `FILE` privilege, `INTO OUTFILE` is refused, and
 `SELECT … FOR UPDATE` is refused. `SLEEP()`, `BENCHMARK()` and `GET_LOCK()` all
 run — resource consumption rather than a privilege violation, bounded by
-`MYSQL_STATEMENT_TIMEOUT_MS` and `MYSQL_MAX_ROWS`. `GET_LOCK()` is the exception:
-the timeout cuts the other two short and limits how long a caller blocks waiting
-on a held lock (`3024 ER_QUERY_TIMEOUT`), but the lock itself is held until it is
-released or the session ends, so a read-scoped caller can hold one past the end
-of its statement.
+`MYSQL_STATEMENT_TIMEOUT_MS` and `MYSQL_MAX_ROWS`.
+
+`GET_LOCK()` is bounded by something else, and it is worth knowing which. A named
+lock belongs to the MySQL **session**, not to the statement, so the statement
+timeout does not release it — it only limits how long a *waiting* caller blocks
+on one (`3024 ER_QUERY_TIMEOUT`). What releases it is that `run_query` opens its
+own connection for each call and closes it when the call returns, ending the
+session and with it the lock. If that ever became a pooled or long-lived
+connection, a read-scoped caller could take a named lock and hold it, stalling
+any writer that coordinates on the same name — so the per-call connection is a
+security property here, not just a simplification. `test_sql_boundary.py` asserts
+it against a live server.
 
 MCP resources (`mysql://<table>/data`) are a separate primitive from tools: they
 do not pass through the tool dispatcher, so they needed the check wiring
