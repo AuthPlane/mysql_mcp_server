@@ -1,14 +1,12 @@
 """The real read-only boundary: MySQL's own privilege system.
 
-`test_sqlguard.py` tests the classifier. This file tests the thing that makes
-the classifier optional. Every statement here is sent *directly to MySQL* over
-the read-only connection, bypassing the classifier entirely, and asserted to be
-refused by the server.
+Every statement here is sent *directly to MySQL* over the read-only connection,
+with nothing in this process inspecting it first, and asserted to be refused by
+the server.
 
-That distinction is the whole design. If a future MySQL syntax defeats the
-classifier, these tests still pass and the server is still safe. If these tests
-fail, the classifier is all that stands between a read-scoped token and
-`DROP TABLE`.
+That is the whole design. No statement classifier stands between a read-scoped
+token and `DROP TABLE` -- these assertions are what does, so if they fail there
+is nothing behind them.
 
 Requires a live MySQL with two accounts:
 
@@ -101,8 +99,8 @@ def test_readonly_account_can_inspect_schema(seeded_table):
 
 
 # --------------------------------------------------------------------------
-# MySQL refuses every write, regardless of what this process thinks. The
-# classifier is not involved in any of these.
+# MySQL refuses every write, regardless of what this process thinks. Nothing in
+# this process inspects any of these.
 # --------------------------------------------------------------------------
 
 WRITES_THE_DATABASE_MUST_REFUSE = [
@@ -147,8 +145,8 @@ def test_data_is_unchanged_after_every_refused_write(seeded_table):
 
 # --------------------------------------------------------------------------
 # Filesystem reach. A SELECT-only grant permits these statements *syntactically*
-# -- they are refused only because the account lacks FILE. Both layers matter:
-# the classifier rejects them early, and this proves the database would too.
+# -- they are refused only because the account lacks FILE, which is why the
+# grant, and not the syntax, is what these assert.
 # --------------------------------------------------------------------------
 
 def test_database_refuses_into_outfile(seeded_table):
@@ -202,15 +200,21 @@ def test_startup_check_agrees_with_the_database():
 
 
 # --------------------------------------------------------------------------
-# The single-account fallback: READ ONLY transactions, for deployments that
-# have not provisioned a second user.
+# Why the account, and not a transaction mode, is the boundary.
+#
+# These two are the live measurement behind the table in AUTHENTICATION.md. A
+# READ ONLY transaction on the read-write account stops DML -- and only DML: the
+# DDL cases in WRITES_THE_DATABASE_MUST_REFUSE above commit implicitly and end
+# the transaction before they run. Nothing in the server opens such a
+# transaction; these record what it would and would not buy.
 # --------------------------------------------------------------------------
 
-def test_read_only_transaction_refuses_writes_on_a_privileged_account(seeded_table):
-    """The weaker fallback still stops writes.
+def test_read_only_transaction_refuses_dml_on_a_privileged_account(seeded_table):
+    """DML is refused, which is the half a read-only transaction does cover.
 
-    This runs as the *read-write* account, so only the transaction mode is doing
-    the work. It is what protects deployments that keep a single MySQL user.
+    Runs as the *read-write* account, so the transaction mode is the only thing
+    doing any work. Contrast the DDL cases, which it lets through -- that gap is
+    why the read path connects as a `SELECT`-only account instead.
     """
     try:
         with connect(**_config(read_only=False)) as conn:
@@ -222,7 +226,9 @@ def test_read_only_transaction_refuses_writes_on_a_privileged_account(seeded_tab
         assert caught.value.errno == 1792, (
             f"expected ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION, got {caught.value.errno}"
         )
-        assert is_denial(caught.value)
+        # Deliberately not asserted through `is_denial`: 1792 is not in
+        # DENIAL_ERRNOS, because no code path opens a read-only transaction and
+        # so nothing can raise it. This asserts MySQL's behaviour, not ours.
     finally:
         with connect(**_config(read_only=False)) as conn:
             with conn.cursor() as cursor:
@@ -285,13 +291,13 @@ def test_mysql_denial_message_names_the_account_which_is_why_we_replace_it(seede
 # --------------------------------------------------------------------------
 
 def test_a_capped_result_set_returns_rows_instead_of_failing():
-    """`MYSQL_MAX_ROWS` was broken for exactly the case it exists for.
+    """`MYSQL_MAX_ROWS` truncates rather than failing on the case it exists for.
 
     `fetchmany(max_rows + 1)` leaves the rest of the result set on the
     connection, and mysql-connector raises "Unread result found" when a cursor
-    with pending rows is closed -- so every query that actually hit the cap
-    failed outright instead of returning a truncated answer. Any query under the
-    cap worked, which is why it went unnoticed.
+    with pending rows is closed -- so a query that hits the cap must have its
+    remainder drained, or it fails outright instead of returning a truncated
+    answer. A query under the cap never exercises this.
     """
     import asyncio
 

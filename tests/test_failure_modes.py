@@ -440,8 +440,8 @@ async def test_a_writable_read_only_account_refuses_to_boot_on_stdio(monkeypatch
     """Fatal, not a warning.
 
     A read-only account that can write is not a degraded configuration, it is a
-    false one: the tool split, the read tools and the READ ONLY transaction
-    fallback all claim a guarantee the database is not enforcing.
+    false one: every read-scoped call claims a guarantee the database is not
+    enforcing, and unlike a missing account there is nothing to preserve.
     """
     from mysql_mcp_server import server as server_module
 

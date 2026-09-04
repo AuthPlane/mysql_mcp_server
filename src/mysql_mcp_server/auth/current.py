@@ -112,8 +112,8 @@ def get_request_identity() -> "Identity | None":
 #
 # Eviction is safe in the only direction that matters. A missing entry falls back
 # to the stream owner, which session binding has already constrained to the same
-# subject -- so eviction degrades to the previous behaviour, never to authorizing
-# against someone else's token. The cap only has to be larger than the number of
+# subject -- so eviction degrades to the stream owner's identity, never to
+# authorizing against someone else's token. The cap only has to be larger than the number of
 # calls genuinely in flight on one process.
 MAX_TRACKED_REQUESTS = 1024
 

@@ -320,7 +320,7 @@ export MYSQL_RO_PASSWORD=a-strong-password
 
 A read-scoped caller then connects as that account, so a write is refused by MySQL — including DDL, stacked statements, and anything smuggled through a version-gated comment. The grants are checked at startup and **the server refuses to start if that account can write**, a misconfiguration that would otherwise look identical to a correct setup.
 
-There is no software fallback. An earlier version wrapped reads in `START TRANSACTION READ ONLY`; measured against MySQL 8.4 that refuses `INSERT`/`UPDATE`/`DELETE` but lets `CREATE`, `DROP`, `ALTER`, `TRUNCATE` and `RENAME` through, because DDL commits implicitly and ends the transaction. It was removed rather than left in place looking like a boundary.
+There is no software fallback, because none of the alternatives is a boundary. Measured against MySQL 8.4, wrapping reads in `START TRANSACTION READ ONLY` refuses `INSERT`/`UPDATE`/`DELETE` but lets `CREATE`, `DROP`, `ALTER`, `TRUNCATE` and `RENAME` through, because DDL commits implicitly and ends the transaction — it would look like a boundary without being one. The account's grants are the boundary.
 
 **Without `MYSQL_RO_USER`,** a read-scoped caller runs on the read-write account and the read scope has nothing enforcing it: a `DROP DATABASE` from a read-only token would succeed. This is permitted so that enabling authentication does not require provisioning a database account first, but with authentication on the server warns about it at startup, warns once when it first happens, and audits every such call as `read_scope_not_enforced`. With authentication off there is no scope to enforce and no warning is emitted.
 

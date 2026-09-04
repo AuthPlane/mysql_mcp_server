@@ -4,11 +4,9 @@ The read/write boundary is **MySQL's privilege system**, not this process. Read
 traffic connects as an account holding only ``SELECT``, so a statement that
 writes is refused by the server. Nothing here inspects SQL.
 
-That is a deliberate reversal. An earlier version of this module classified
-statements — parsing them on a comment- and literal-stripped copy to decide
-"read" or "write" — and the read path relied on that verdict plus a
-``START TRANSACTION READ ONLY``. Measured against MySQL 8.4, that combination
-does not hold:
+The ``SELECT``-only account is the mechanism because it is the only candidate
+that holds. Measured against MySQL 8.4, against the alternative of wrapping the
+read path in a ``START TRANSACTION READ ONLY`` on the read-write account:
 
 ===================================  ==========================  =================
 Statement                            READ ONLY txn, RW account   SELECT-only acct
@@ -20,23 +18,28 @@ Statement                            READ ONLY txn, RW account   SELECT-only acc
 ``SELECT 1; DROP TABLE t``            **executed**                refused (1142)
 ===================================  ==========================  =================
 
-DDL performs an implicit commit, which ends the read-only transaction before the
-statement runs, so ``DROP TABLE`` went straight through. The fallback was never
-a boundary; the classifier was carrying it alone, and a classifier is exactly
-what should not be load-bearing — there is always one more syntax nobody thought
-of.
+A read-only transaction is not a boundary: DDL performs an implicit commit, which
+ends the transaction before the statement runs, so ``DROP TABLE`` goes straight
+through. Covering that column would take a statement classifier — parsing each
+statement on a comment- and literal-stripped copy to decide "read" or "write" —
+and a hand-written SQL classifier is exactly what should not be load-bearing;
+there is always one more syntax nobody thought of. The ``SELECT``-only account
+refuses the whole column without parsing anything, which is why it, and not a
+transaction mode, is the boundary.
 
-So the read-only account became the whole mechanism and the classifier is gone.
 Which connection a call gets is decided by the caller's scope in
 ``auth.policy.connection_for``; where no read-only account is configured that
 routing has nothing to route to, and the server says so at startup.
 
 What a ``SELECT``-only grant still permits was checked too:
 ``LOAD_FILE()`` returns ``NULL`` without the ``FILE`` privilege, ``INTO OUTFILE``
-is refused (1227), and ``SELECT ... FOR UPDATE`` is refused (1142). ``SLEEP()``
-and ``GET_LOCK()`` do run — resource consumption rather than a privilege
-violation, and bounded by ``MYSQL_STATEMENT_TIMEOUT_MS`` and ``MYSQL_MAX_ROWS``
-rather than by parsing.
+is refused (1227), and ``SELECT ... FOR UPDATE`` is refused (1142). ``SLEEP()``,
+``BENCHMARK()`` and ``GET_LOCK()`` all run — resource consumption rather than a
+privilege violation, and bounded by ``MYSQL_STATEMENT_TIMEOUT_MS`` and
+``MYSQL_MAX_ROWS`` rather than by parsing. ``GET_LOCK()`` is the one that escapes
+that bound: the timeout cuts the other two short and limits how long a caller
+blocks waiting on a held lock (3024), but the lock itself lives until it is
+released or the session ends.
 
 What remains here is the translation layer: recognising a refusal *as* a refusal
 so it reaches the caller as a policy answer instead of an opaque database fault.
@@ -60,7 +63,6 @@ DENIAL_ERRNOS = frozenset(
         1227,  # ER_SPECIFIC_ACCESS_DENIED     - e.g. INTO OUTFILE needs FILE
         1290,  # ER_OPTION_PREVENTS_STATEMENT  - server started --read-only
         1370,  # ER_PROCACCESS_DENIED_ERROR
-        1792,  # ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
     }
 )
 

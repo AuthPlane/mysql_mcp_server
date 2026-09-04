@@ -99,8 +99,8 @@ def test_get_db_config_uses_the_readonly_account_when_configured(monkeypatch):
 def test_get_db_config_falls_back_when_no_readonly_account_exists(monkeypatch):
     """Backward compatibility: existing single-user deployments keep working.
 
-    The read path then relies on READ ONLY transactions plus classification,
-    which is weaker -- the server warns about this at startup.
+    Read traffic then runs on the read-write account, so the read scope has
+    nothing enforcing it -- the server warns about this at startup.
     """
     monkeypatch.setenv("MYSQL_USER", "rw_user")
     monkeypatch.setenv("MYSQL_PASSWORD", "rw_pass")
@@ -125,20 +125,19 @@ def test_readonly_account_requires_a_password_to_be_set(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# A write sent to the read tool reaches MySQL and is refused *there*.
+# A write sent on a read-scoped token reaches MySQL and is refused *there*.
 #
-# This is the reversal at the centre of the design. `read_query` used to run a
-# classifier and refuse locally. Measured against MySQL 8.4, the fallback that
-# classifier was backing up -- START TRANSACTION READ ONLY on the read-write
-# account -- refuses INSERT/UPDATE/DELETE (1792) but lets CREATE, DROP, ALTER,
-# TRUNCATE and RENAME through, because DDL commits implicitly and ends the
-# transaction. The SELECT-only account refuses all of them (1142), plus stacked
-# statements and INTO OUTFILE (1227).
+# This is the point at the centre of the design: the refusal belongs to the
+# database, not to this process. Measured against MySQL 8.4, the alternative --
+# START TRANSACTION READ ONLY on the read-write account -- refuses
+# INSERT/UPDATE/DELETE (1792) but lets CREATE, DROP, ALTER, TRUNCATE and RENAME
+# through, because DDL commits implicitly and ends the transaction. The
+# SELECT-only account refuses all of them (1142), plus stacked statements and
+# INTO OUTFILE (1227), without anything here parsing the statement.
 #
-# So the account became mandatory and the classifier was deleted. What these
-# tests assert is that the statement is *forwarded on the read connection* --
-# the refusal itself belongs to MySQL and is covered by `test_sql_boundary.py`
-# against a live server.
+# What these tests assert is that the statement is *forwarded on the read
+# connection* -- the refusal itself belongs to MySQL and is covered by
+# `test_sql_boundary.py` against a live server.
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -611,7 +610,7 @@ async def test_execute_sql_on_a_read_token_still_reaches_mysql_for_a_write(
     It goes to the SELECT-only connection and MySQL refuses it, which is a real
     privilege boundary rather than this process's opinion about the statement.
     `run_query` maps the resulting errno to a StatementDenied (see sqlguard's
-    DENIAL_ERRNOS, which includes 1142 and 1792).
+    DENIAL_ERRNOS, which includes 1142).
     """
     stream_owner("mysql:read")
     await call_tool("execute_sql", {"query": "DELETE FROM demo"})

@@ -50,7 +50,7 @@ export MCP_TRANSPORT=sse
 export MCP_AUTH_MODE=authplane
 export AUTHPLANE_ISSUER=https://auth.example.com    # your Authplane server
 export AUTHPLANE_RESOURCE=https://mcp.example.com   # this server's canonical URI
-export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...   # required: a SELECT-only account
+export MYSQL_RO_USER=mcp_ro MYSQL_RO_PASSWORD=...   # a SELECT-only account; without it the read scope is not enforced
 python -m mysql_mcp_server
 ```
 
@@ -144,11 +144,12 @@ carried through:
 | `JWKSFetchError`, `MetadataFetchError`, `CircuitOpenError` | 503 | `temporarily_unavailable` | **Retry with the same token.** Authplane is unreachable; the token may be fine |
 | `ProtocolError`, `VerifierRuntimeError`, anything unexpected | 500 | `server_error` | Retry; report if it persists |
 
-The 503 row is the one that matters operationally. An earlier version collapsed
-everything but 403 into `401 invalid_token`, which meant an Authplane outage told
-every client its credential was bad — so a conforming client would discard a
-working token and re-authenticate against the server that was already down, and
-then get throttled here for the attempts.
+The 503 row is the one that matters operationally, and the reason all four
+statuses are carried through rather than collapsed. Reporting anything but 403 as
+`401 invalid_token` would tell every client its credential was bad during an
+Authplane outage — so a conforming client would discard a working token and
+re-authenticate against the server that was already down, and then get throttled
+here for the attempts.
 
 Two properties follow, and both are enforced rather than advisory:
 
@@ -242,14 +243,13 @@ statement**:
 | neither | — | Refused before the database is reached |
 | no identity (stdio, auth off) | read-write account | Unchanged from before this feature |
 
-This is the reason the tool is not deprecated, and the reason it is now the only
-SQL tool. The earlier design had one connection, so the only safe reading of
-"arbitrary SQL" was "treat every call as a write" — and a tool that cannot be
-authorized precisely is one you take away. With the account doing the enforcing,
-precision comes from MySQL's grants rather than from this process understanding
-the statement, which also retired the `read_query`/`write_query` pair that stood
-in for it: their scope gate proved nothing the connection was not already
-proving.
+This is the reason `execute_sql` needs no deprecation, and the reason it is the
+only SQL tool. With a single connection the only safe reading of "arbitrary SQL"
+is "treat every call as a write" — and a tool that cannot be authorized precisely
+is one you take away. With the account doing the enforcing, precision comes from
+MySQL's grants rather than from this process understanding the statement, so a
+narrower read-only SQL tool alongside it would add no gate the connection is not
+already applying.
 
 The third row is the one deliberate fail-open. Failing closed would refuse every
 read-scoped token until an operator provisions a database account, which breaks
@@ -260,15 +260,15 @@ at startup, warned once when it first happens, and recorded per call as
 `tool_call_authorized` alone would read as "a read happened" for a statement that
 ran with privileges to drop the database.
 
-A refusal arrives as a MySQL error (`1142 ER_TABLEACCESS_DENIED_ERROR`, `1792
-ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION`, and the rest of `DENIAL_ERRNOS` in
+A refusal arrives as a MySQL error (`1142 ER_TABLEACCESS_DENIED_ERROR`, `1227
+ER_SPECIFIC_ACCESS_DENIED_ERROR`, and the rest of `DENIAL_ERRNOS` in
 `sqlguard.py`), which is mapped to a tool error with `isError: true` and a fixed
 message. The account name and host in MySQL's own text are not echoed to the
 caller.
 
-**Nothing in this server inspects your SQL.** There was a statement classifier;
-it has been removed, and `MYSQL_RO_USER` does the work instead. The reason is
-measured rather than argued — against MySQL 8.4:
+**Nothing in this server inspects your SQL.** `MYSQL_RO_USER` does that work,
+because it is the only candidate that holds. The reason is measured rather than
+argued — against MySQL 8.4:
 
 | Statement | `START TRANSACTION READ ONLY`, read-write account | `SELECT`-only account |
 |---|---|---|
@@ -278,17 +278,24 @@ measured rather than argued — against MySQL 8.4:
 | `SELECT … INTO OUTFILE` | refused (1227) | refused (1227) |
 | `GRANT` | refused (1044) | refused (1044) |
 
-DDL performs an implicit commit, which ends the read-only transaction before the
-statement runs — so `DROP TABLE` went straight through the old fallback, and the
-classifier was carrying that path alone. A hand-written SQL classifier is exactly
-what should not be load-bearing; there is always one more syntax nobody thought
-of. So the account became mandatory and the classifier was deleted.
+A read-only transaction is not a boundary: DDL performs an implicit commit, which
+ends the transaction before the statement runs, so `DROP TABLE` goes straight
+through. Covering that column would take a statement classifier, and a
+hand-written SQL classifier is exactly what should not be load-bearing; there is
+always one more syntax nobody thought of. The `SELECT`-only account refuses the
+whole column without parsing anything, which is why it — and not a transaction
+mode — is the boundary. Where it is not configured there is no boundary at all;
+that is the third row of the table above.
 
 What a `SELECT`-only grant still permits was checked too: `LOAD_FILE()` returns
 `NULL` without the `FILE` privilege, `INTO OUTFILE` is refused, and
-`SELECT … FOR UPDATE` is refused. `SLEEP()` and `GET_LOCK()` do run — resource
-consumption rather than a privilege violation, bounded by
-`MYSQL_STATEMENT_TIMEOUT_MS` and `MYSQL_MAX_ROWS`.
+`SELECT … FOR UPDATE` is refused. `SLEEP()`, `BENCHMARK()` and `GET_LOCK()` all
+run — resource consumption rather than a privilege violation, bounded by
+`MYSQL_STATEMENT_TIMEOUT_MS` and `MYSQL_MAX_ROWS`. `GET_LOCK()` is the exception:
+the timeout cuts the other two short and limits how long a caller blocks waiting
+on a held lock (`3024 ER_QUERY_TIMEOUT`), but the lock itself is held until it is
+released or the session ends, so a read-scoped caller can hold one past the end
+of its statement.
 
 MCP resources (`mysql://<table>/data`) are a separate primitive from tools: they
 do not pass through the tool dispatcher, so they needed the check wiring
