@@ -24,7 +24,7 @@ subprocess and drives it over HTTP.
 ```bash
 docker run -d --name mcp-mysql -p 3306:3306 \
   -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=testdb \
-  -e MYSQL_USER=mcp -e MYSQL_PASSWORD=mcppw mysql:8
+  -e MYSQL_USER=mcp -e MYSQL_PASSWORD=mcppw mysql:8.4
 ```
 
 The read/write separation tests also need a `SELECT`-only account, because they

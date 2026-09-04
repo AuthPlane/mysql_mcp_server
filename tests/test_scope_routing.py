@@ -275,11 +275,11 @@ def test_scope_names_are_available_independently_of_any_tool_name():
 # same scope and use the same MySQL account.
 #
 # `list_resources` and `read_resource` are a separate MCP primitive: they never
-# pass through `call_tool`, so they inherited neither the scope check nor the
-# read/write split. Reading `mysql://orders/data` ran
-# `SELECT * FROM orders LIMIT 100` on the read-write account for any
-# authenticated caller -- including one holding no scope at all -- while
-# `read_query` ran the same statement, scope-gated, on the SELECT-only account.
+# pass through `call_tool`, so they inherit neither the scope check nor the
+# read/write split and must carry both explicitly. Without that, reading
+# `mysql://orders/data` runs `SELECT * FROM orders LIMIT 100` on the read-write
+# account for any authenticated caller -- including one holding no scope at all
+# -- which is a wider door to the same tables than any tool offers.
 # --------------------------------------------------------------------------
 
 @pytest.fixture
@@ -339,8 +339,9 @@ async def test_resource_reads_use_the_read_only_account(
 
     await server_module.read_resource(AnyUrl("mysql://demo/data"))
     assert captured_config == [True], (
-        "reading a table through the resource URI ran on the read-write account "
-        "while read_query ran the same statement on the read-only one"
+        "reading a table through the resource URI ran on the read-write account; "
+        "the resource primitive must use the read-only account like every other "
+        "read path"
     )
 
     captured_config.clear()

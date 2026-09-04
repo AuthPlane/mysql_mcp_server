@@ -2,7 +2,7 @@
 
 Hermetic on purpose: no authorization server, no database, no network. The
 middleware's job is to decide *whether* a request proceeds, and that logic must
-be testable without standing up an OAuth deployment. `test_live_authplane.py`
+be testable without standing up an OAuth deployment. `test_authplane_live.py`
 covers the real-token path.
 
 The fake verifier is not a shortcut around the interesting parts — it is what

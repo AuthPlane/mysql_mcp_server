@@ -380,7 +380,8 @@ async def test_a_read_token_can_list_tools(server, read_token):
     names = {tool.name for tool in tools.tools}
     assert {"execute_sql", "get_schema_info", "get_table_sample"} <= names
     assert not {"read_query", "write_query"} & names, (
-        "the removed tools must not still be advertised"
+        "`execute_sql` is the only tool that takes SQL; a scope-gated read/write "
+        "pair alongside it would gate on the statement rather than the connection"
     )
 
 
