@@ -273,11 +273,11 @@ def test_bearer_token_helper_reports_specific_failures():
 def test_a_dpop_bound_token_is_accepted_under_the_dpop_scheme(header, expected_scheme):
     """RFC 9449 §7.1 presents a bound token as ``Authorization: DPoP <token>``.
 
-    Rejecting that scheme refused every conforming DPoP client with a 401 before
-    its proof was ever examined, which made the whole DPoP feature unusable over
-    HTTP. It went unnoticed because the DPoP tests inject tokens through a fake
-    verifier and never build this header, and RFC 7235 §2.1 makes the comparison
-    case-insensitive so all four spellings must work.
+    The scheme must be accepted here or a conforming DPoP client is refused with
+    a 401 before its proof is ever examined, which makes DPoP unusable over HTTP.
+    This is the only test that builds the header: the rest inject tokens through
+    a fake verifier and construct the request context directly. RFC 7235 §2.1
+    makes the comparison case-insensitive, so all four spellings must work.
     """
     token, scheme, error = bearer_token([(b"authorization", header)])
 
@@ -346,15 +346,17 @@ def test_unexpected_verifier_error_fails_closed_without_leaking():
 #
 # RFC 9728 §3 forms the well-known URL by inserting the segment between host and
 # the resource's own path, so a resource with a path moves the document. The
-# route used to be registered at a fixed constant while the challenge came from
-# the SDK's suffix-aware `prm_url()`: with a path-bearing resource the 401 named
-# a URL nothing served, and discovery failed with nothing in the log.
+# route and the challenge must therefore be derived from the same place -- the
+# verifier's suffix-aware `metadata_url()`. Register the route at a fixed
+# constant instead and a path-bearing resource makes the 401 name a URL nothing
+# serves, so discovery fails with nothing in the log.
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "metadata_url,expected",
     [
-        # Root resource: unchanged, which is why this was invisible.
+        # Root resource: the suffix is empty, so this case alone cannot detect a
+        # route that ignores the resource's path.
         ("http://testserver/.well-known/oauth-protected-resource", PRM_PATH),
         # Path-bearing resource: the path becomes a suffix.
         (
@@ -705,21 +707,21 @@ def test_oversized_body_is_rejected_not_buffered():
 
 
 # --------------------------------------------------------------------------
-# A write sent to the read-only tool is refused here, with a status, rather
-# than after the transport has already answered 202.
+# A scope refusal is answered here, with a status, rather than after the
+# transport has already answered 202.
+#
+# What the middleware decides is scope, and only scope -- `probe_read` and
+# `probe_write` below are fixture tools standing in for any scope-gated tool. It
+# does not look at statement content: on a read-scoped call the SQL goes to the
+# `SELECT`-only account and MySQL refuses it, including the DDL and stacked
+# writes that parsing is weakest against. `tests/test_scope_routing.py` pins
+# which connection a call is routed to; `tests/test_sql_boundary.py` pins MySQL's
+# refusal against a live server.
 # --------------------------------------------------------------------------
-
-# The middleware used to run the statement classifier on read-only tools and
-# answer 403 before the frame reached the transport. That check is gone along
-# with the classifier: the read-only MySQL account refuses these statements
-# itself, including the DDL and the stacked writes a classifier is weakest
-# against. `tests/test_tool_split.py` pins that the read tool forwards on the
-# read-only connection; `tests/test_sql_boundary.py` pins MySQL's refusal
-# against a live server.
 
 
 def test_write_tool_still_accepts_writes():
-    """The split must not break the write path."""
+    """A caller holding the write scope is not obstructed."""
     client, _ = build_app()
     response = client.post(
         "/messages/?session_id=abc123",

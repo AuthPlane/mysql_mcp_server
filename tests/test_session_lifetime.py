@@ -2,11 +2,11 @@
 
 `SessionBinding` maps a session id to the subject that opened it, and that map
 is what stops a valid token belonging to B from being accepted on a session
-opened by A. It used to have no release path at all: `forget()` existed and was
-never called, so the table only grew. On a long-lived deployment it drifted
-towards its 4,096-entry cap and then began evicting entries for sessions that
-were still open -- and an evicted session is no longer subject-checked, which is
-the single outcome the table exists to prevent.
+opened by A. A binding must therefore be released when its stream closes: with
+no release path the table only grows, and on a long-lived deployment it drifts
+towards its 4,096-entry cap and starts evicting entries for sessions that are
+still open -- and an evicted session is no longer subject-checked, which is the
+single outcome the table exists to prevent.
 
 Testing this needs a stream that is genuinely still open while a second request
 is made, which `TestClient` cannot provide: it drives the ASGI app through one

@@ -400,16 +400,16 @@ async def test_a_read_token_can_run_a_select(server, read_token):
 async def test_a_read_token_is_refused_a_write(server, read_token):
     """A refusal must arrive as a tool error, and must not hang.
 
-    This is the regression guard for the bug the first real-client run found. The
-    refusal used to be an HTTP 403 on the POST, which a conforming client ignores
-    while it waits for a JSON-RPC response that never came. `wait_for` is the
-    assertion: a hang fails the test rather than stalling the suite.
+    The refusal has to travel as a JSON-RPC response, not as an HTTP 403 on the
+    POST: a conforming client ignores the status and keeps waiting for a
+    JSON-RPC response, so a refusal sent that way hangs the client. `wait_for` is
+    the assertion -- a hang fails the test rather than stalling the suite.
 
-    Note whose refusal it is now: the statement reaches MySQL on the SELECT-only
+    Note whose refusal this is: the statement reaches MySQL on the SELECT-only
     account and the *database* refuses it. There is no scope gate on
     `execute_sql`, so the message is MySQL's denial rather than a scope name --
-    which is the whole point, since a scope gate on arbitrary SQL could only ever
-    have been an opinion about the statement.
+    which is the point, since a scope gate on arbitrary SQL could only ever be
+    an opinion about the statement.
     """
     statement = "CREATE TABLE should_not_exist (id INT)"
 
@@ -426,8 +426,9 @@ async def test_a_read_token_is_refused_a_write(server, read_token):
 async def test_a_read_token_is_refused_a_write_hidden_in_a_comment(server, read_token):
     """The syntax a classifier misses and a privilege system does not see at all.
 
-    `/* c */ DROP TABLE` was the classifier's problem. On the SELECT-only account
-    it makes no difference: MySQL refuses the DROP whatever it is wrapped in.
+    Wrapping the statement in a comment is what defeats parsing. On the
+    SELECT-only account it makes no difference: MySQL refuses the DROP whatever
+    it is wrapped in, because the account cannot perform it.
     """
     async with mcp_session(read_token) as session:
         result = await asyncio.wait_for(

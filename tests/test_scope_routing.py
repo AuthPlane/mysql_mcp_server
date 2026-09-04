@@ -10,11 +10,9 @@ Why this layer matters even though the middleware also enforces scopes: the
 stdio transport has no HTTP layer, so nothing here is reachable by the auth
 middleware. For a stdio user these checks are the only ones that run.
 
-Replaces `test_tool_split.py`. The read_query/write_query pair it covered was
-removed: their scope gate proved nothing the connection was not already
-proving, and having both alongside an `execute_sql` with an empty gate made the
-authorization model read as though the arbitrary-SQL tool were the unprotected
-one. `test_sql_boundary.py` still covers what MySQL itself refuses.
+Scope-gated tools that take a table name rather than SQL (`get_schema_info`,
+`get_table_sample`) are covered here too. What MySQL itself refuses is covered
+by `test_sql_boundary.py`, against a live server.
 """
 
 import pytest

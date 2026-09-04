@@ -403,9 +403,10 @@ async def test_unset_transport_defaults_to_stdio(monkeypatch):
 # *Verifying* the account is a property of the database configuration:
 # `get_db_config(read_only=True)` honours MYSQL_RO_USER unconditionally --
 # including over stdio, which never reaches the SSE path -- so an account that
-# can write is fatal on every transport. This check used to sit inside
-# `if auth_settings.enabled:`, and an operator running stdio with a
-# misprovisioned account got the weaker posture with no check and no warning.
+# can write is fatal on every transport, and the check runs in `main()` ahead of
+# the transport split rather than inside `if auth_settings.enabled:`. Gate it on
+# auth instead and an operator running stdio with a misprovisioned account gets
+# the weaker posture with no check and no warning.
 #
 # The account being *absent* is different: there is a working degraded mode, and
 # it only degrades something if scopes exist. So that half is a warning, and only

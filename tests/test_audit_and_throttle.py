@@ -511,7 +511,7 @@ async def test_a_database_refusal_in_the_tool_layer_is_audited(
     different findings for whoever reads the trail -- one is a caller without
     permission, the other a caller with permission whose statement the database
     refused. `run_query` is replaced with the refusal MySQL gives the read-only
-    account, since the tool layer no longer inspects statements itself.
+    account, since the tool layer does not inspect statements itself.
     """
     from mysql_mcp_server import server as server_module
     from mysql_mcp_server.sqlguard import DENIAL_MESSAGE, StatementDenied
