@@ -20,6 +20,16 @@ from mcp.types import (
 from pydantic import AnyUrl
 from dotenv import load_dotenv
 
+from .auth import audit as audit_log
+from .auth import policy
+from .auth.current import get_identity as current_identity
+from .auth.current import release_request_identity
+from .auth.settings import auth_enabled_in_env
+from .sqlguard import (
+    CONNECT_DENIED_MESSAGE, StatementDenied, denial_message, is_connect_denial,
+    is_denial,
+)
+
 # Load environment variables from .env file if it exists.
 # This allows for easy local configuration of database and SSH credentials.
 load_dotenv()
@@ -111,13 +121,34 @@ def maybe_ssh_tunnel():
         except Exception as e:
             logger.error(f"Error terminating SSH tunnel: {e}")
 
-def get_db_config(host=None, port=None):
+def has_readonly_credentials() -> bool:
+    """Whether a separate read-only MySQL account is configured.
+
+    That account is the read/write boundary -- see ``_check_read_path()`` for
+    what its absence costs and ``sqlguard`` for why nothing here parses SQL.
+    """
+    return bool(os.getenv("MYSQL_RO_USER"))
+
+
+def get_db_config(host=None, port=None, read_only: bool = False):
     """
     Constructs the database connection configuration dictionary from environment variables.
     Validates that required credentials (USER and PASSWORD) are present.
+
+    With ``read_only=True`` connects as the read-only account instead. Same host,
+    port, and database — only the identity differs, because the privilege set
+    attached to that identity *is* the read/write control. Nothing in this
+    process inspects the statement.
     """
-    user = os.getenv("MYSQL_USER")
-    password = os.getenv("MYSQL_PASSWORD")
+    if read_only and has_readonly_credentials():
+        user = os.getenv("MYSQL_RO_USER")
+        password = os.getenv("MYSQL_RO_PASSWORD")
+        if password is None:
+            logger.error("MYSQL_RO_USER is set but MYSQL_RO_PASSWORD is not (use an empty string for no password)")
+            raise ValueError("Missing required database configuration")
+    else:
+        user = os.getenv("MYSQL_USER")
+        password = os.getenv("MYSQL_PASSWORD")
     database = os.getenv("MYSQL_DATABASE")
 
     if not user:
@@ -184,8 +215,77 @@ def get_db_config(host=None, port=None):
 
     return config
 
+# Marks the one problem `verify_readonly_account` reports that is not a verdict
+# about the grants: the database could not be reached to ask. Distinguished
+# because the two need different messages -- an operator told "MYSQL_RO_USER does
+# not have a read-only privilege set" will go and inspect grants that are fine.
+UNVERIFIABLE_PREFIX = "could not verify read-only grants"
+
+# Privileges that a read-only account must not hold. Checked at startup rather
+# than trusted, because "the operator provisioned it correctly" is the kind of
+# assumption that is wrong exactly when it matters.
+
+FORBIDDEN_RO_PRIVILEGES = (
+    "ALL PRIVILEGES", "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
+    "TRUNCATE", "FILE", "GRANT OPTION", "SUPER", "RELOAD", "PROCESS", "SHUTDOWN",
+    "REFERENCES", "INDEX", "LOCK TABLES", "EXECUTE",
+)
+
+
+# Which scope each tool needs, which MySQL account a scope reaches, and the
+# audit records for both, live in `auth/policy.py` -- one subsystem rather than
+# three blocks wedged in between the connection helpers and the tool handlers.
+# `policy.configure()` installs it from the parsed auth settings at startup;
+# until then its maps are empty, which is how "auth is off" is represented.
+
+
+def verify_readonly_account() -> list[str]:
+    """Check that the read-only account cannot write. Returns a list of problems.
+
+    Runs `SHOW GRANTS FOR CURRENT_USER()` on the read connection, so it reflects
+    what MySQL will actually enforce rather than what the configuration intends.
+    Returning problems instead of raising lets the caller decide whether a
+    misconfiguration is fatal.
+    """
+    problems: list[str] = []
+    if not has_readonly_credentials():
+        return problems
+
+    try:
+        with maybe_ssh_tunnel() as (host, port):
+            config = get_db_config(host, port, read_only=True)
+            with connect(**config) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SHOW GRANTS FOR CURRENT_USER()")
+                    grants = [row[0].upper() for row in cursor.fetchall()]
+    except Error as exc:
+        return [f"{UNVERIFIABLE_PREFIX}: {getattr(exc, 'msg', None) or exc}"]
+
+    for grant in grants:
+        # Only the privilege list matters, not the object it applies to: a
+        # database name containing the word "INSERT" would otherwise trip this.
+        privileges = grant.split(" ON ")[0]
+        for privilege in FORBIDDEN_RO_PRIVILEGES:
+            if re.search(rf"\b{re.escape(privilege)}\b", privileges):
+                problems.append(
+                    f"MYSQL_RO_USER holds {privilege}, so the read path is not read-only "
+                    f"({grant})"
+                )
+    return problems
+
+
 # Create the MCP Server instance.
 app = Server("mysql_mcp_server")
+
+
+def require_read_scope(operation: str) -> None:
+    """Refuse ``operation`` unless the caller holds the read scope.
+
+    A thin wrapper so the resource handlers do not each have to resolve the
+    identity; the decision itself is ``policy.require_read_scope``.
+    """
+    policy.require_read_scope(operation, current_identity())
+
 
 @app.list_resources()
 async def list_resources() -> list[Resource]:
@@ -193,9 +293,12 @@ async def list_resources() -> list[Resource]:
     Lists available MySQL tables (or databases if no default database is configured) as resources.
     This allows AI agents to discover what data is available.
     """
+    require_read_scope("list_resources")
+
     def _sync_list():
         with maybe_ssh_tunnel() as (host, port):
-            config = get_db_config(host, port)
+            # Listing is a read, so it uses the read-only account.
+            config = get_db_config(host, port, read_only=True)
             try:
                 with connect(**config) as conn:
                     with conn.cursor() as cursor:
@@ -247,9 +350,13 @@ async def read_resource(uri: AnyUrl) -> str:
     """
     Reads the content of a specific table or lists tables within a database based on the provided URI.
     """
+    require_read_scope("read_resource")
+
     def _sync_read():
         with maybe_ssh_tunnel() as (host, port):
-            config = get_db_config(host, port)
+            # A resource read reaches the same rows as a read-scoped tool
+            # call, so it uses the same account.
+            config = get_db_config(host, port, read_only=True)
             uri_str = str(uri)
             if not uri_str.startswith("mysql://"):
                 raise ValueError(f"Invalid URI scheme: {uri_str}")
@@ -301,7 +408,10 @@ async def list_tools() -> list[Tool]:
                 "Execute a SQL statement against the MySQL server. "
                 "Use for SELECT, DML (INSERT/UPDATE/DELETE), SHOW, DESCRIBE, and ad-hoc queries. "
                 "Supports cross-database queries using database.table notation. "
-                "Single statements only — use fully qualified names instead of USE statements."
+                "Single statements only — use fully qualified names instead of USE statements. "
+                "The privileges it runs with follow the caller's scope: a read-scoped caller "
+                "reaches the database as a SELECT-only account, so a write is refused by "
+                "MySQL rather than by any inspection of the SQL here."
             ),
             inputSchema={
                 "type": "object",
@@ -377,19 +487,55 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """
     Dispatches tool calls from AI agents to the appropriate implementation logic.
     """
+    # Resolved before the try so the handler below can always reach them, and so
+    # a denial is attributed to the right identity even if it is raised deeper in.
+    #
+    # This is the identity of the token on the request that carried *this* call,
+    # not the one that opened the stream -- see `auth/current.py`. The two differ
+    # whenever a client holds several tokens for one subject, which needs no
+    # revocation: asking for a narrower token leaves the wider one alive.
+    identity = current_identity()
+    denial_event = audit_log.EVENT_DENIED_STATEMENT
+
     try:
         logger.info(f"Calling tool: {name} with arguments: {arguments}")
+
+        # Scope check. Runs here rather than in the auth middleware because a
+        # refusal raised here becomes a JSON-RPC error the client receives: a
+        # conforming MCP client ignores the POST's HTTP status and waits on the
+        # stream, so an HTTP-only 403 makes it hang. Observed with the official
+        # MCP client library.
+        missing = policy.missing_scopes(identity, name)
+        if missing:
+            denial_event = audit_log.EVENT_DENIED_SCOPE
+            raise policy.scope_denial(identity, name, missing)
 
         if name == "execute_sql":
             query = arguments.get("query")
             if not query:
                 raise ValueError("Query is required")
+
             if ";" in query.strip().rstrip(";"):
                 return [TextContent(type="text", text=(
                     "Only single statements are supported. "
                     "Instead of USE statements, use fully qualified names: database.table"
                 ))]
-            return await run_query(query)
+
+            # The caller's scope picks the connection; the connection's grants
+            # enforce the outcome. That is what lets one tool taking arbitrary
+            # SQL be authorized precisely, with a single mechanism to get right
+            # rather than a scope gate layered over the same door. A refusal from
+            # policy.connection_for is about scope, not the statement; anything
+            # after it is MySQL's verdict.
+            denial_event = audit_log.EVENT_DENIED_SCOPE
+            read_only = policy.connection_for(
+                identity,
+                readonly_available=has_readonly_credentials(),
+                tool=name,
+                statement=query,
+            )
+            denial_event = audit_log.EVENT_DENIED_STATEMENT
+            return await run_query(query, read_only=read_only)
 
         elif name == "get_schema_info":
             table_name = arguments.get("table_name")
@@ -399,23 +545,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 query = f"SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE {schema_filter} AND TABLE_NAME = '{tbl}' ORDER BY ORDINAL_POSITION"
             else:
                 query = "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
-            return await run_query(query)
+            return await run_query(query, read_only=True)
 
         elif name == "get_table_sample":
             db, tbl = parse_table_arg(arguments.get("table_name"))
             limit = min(arguments.get("limit", 5), 20)
             table_ref = f"`{db}`.`{tbl}`" if db else f"`{tbl}`"
             query = f"SELECT * FROM {table_ref} LIMIT {limit}"
-            return await run_query(query)
+            return await run_query(query, read_only=True)
 
         else:
             raise ValueError(f"Unknown tool: {name}")
+    except StatementDenied as e:
+        # Propagate so the MCP layer reports isError: true. Swallowing it into a
+        # normal TextContent result -- as the generic handler below does, by
+        # design, for unexpected failures -- would present a refusal as a
+        # successful answer.
+        logger.info("Denied tool call %s: %s", name, e)
+        policy.record_denial(denial_event, identity, name, arguments, str(e))
+        raise
     except Exception as e:
         logger.error(f"Error in call_tool: {str(e)}")
         logger.error(traceback.format_exc())
         # Return the error as a TextContent so the client can display it.
         # This addresses Issue #50 where errors were not being reported clearly.
         return [TextContent(type="text", text=f"Error calling tool {name}: {str(e)}")]
+    finally:
+        # The call is over, so the per-request identity has no further reader.
+        # Released here rather than when the POST returned, because the POST is
+        # answered before this handler runs.
+        release_request_identity()
 
 @app.list_prompts()
 async def list_prompts() -> list[Prompt]:
@@ -492,18 +651,59 @@ async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
     else:
         raise ValueError(f"Unknown prompt: {name}")
 
-async def run_query(query: str) -> list[TextContent]:
+def get_max_rows() -> int:
+    """Row cap for a single result set. 0 disables it.
+
+    Without a cap, one `SELECT * FROM huge_table` materialises the whole table
+    in this process and then again as a string. The cap is on rows returned to
+    the caller, not on rows the server scans.
+    """
+    try:
+        value = int(os.getenv("MYSQL_MAX_ROWS", "1000"))
+    except ValueError:
+        logger.warning("MYSQL_MAX_ROWS is not an integer; using 1000.")
+        return 1000
+    return max(value, 0)
+
+
+def get_statement_timeout_ms() -> int:
+    """Server-side limit on read statements. 0 disables it.
+
+    Applies via `max_execution_time`, which MySQL enforces for SELECT only —
+    it is not a general-purpose timeout, and writes are unaffected.
+    """
+    try:
+        return max(int(os.getenv("MYSQL_STATEMENT_TIMEOUT_MS", "30000")), 0)
+    except ValueError:
+        logger.warning("MYSQL_STATEMENT_TIMEOUT_MS is not an integer; using 30000.")
+        return 30000
+
+
+async def run_query(query: str, read_only: bool = False) -> list[TextContent]:
     """
     A helper function that handles the execution of a SQL query,
     formatting the results based on the query type (SHOW, DESCRIBE, SELECT, or DML).
     Uses anyio.to_thread.run_sync to prevent blocking the async event loop.
+
+    ``read_only=True`` routes to the read-only MySQL account when one is
+    configured. A statement that writes is then refused by MySQL and surfaces as
+    a ``StatementDenied`` (see ``sqlguard.DENIAL_ERRNOS``); nothing here parses
+    it. With no such account ``get_db_config`` returns the read-write
+    credentials, and the caller of this function is responsible for having warned
+    about that -- see ``policy.connection_for()``.
     """
     def _sync_run():
         with maybe_ssh_tunnel() as (host, port):
-            config = get_db_config(host, port)
+            config = get_db_config(host, port, read_only=read_only)
             try:
                 with connect(**config) as conn:
                     with conn.cursor() as cursor:
+                        if read_only:
+                            timeout_ms = get_statement_timeout_ms()
+                            if timeout_ms:
+                                # Session-scoped, so it cannot leak into another
+                                # connection; each call opens its own.
+                                cursor.execute(f"SET SESSION max_execution_time = {timeout_ms}")
                         cursor.execute(query)
                         query_upper = query.strip().upper()
 
@@ -528,12 +728,43 @@ async def run_query(query: str) -> list[TextContent]:
                         # Handling for standard result sets (SELECT, etc.).
                         elif cursor.description is not None:
                             columns = [desc[0] for desc in cursor.description]
-                            rows = cursor.fetchall()
+                            max_rows = get_max_rows()
+                            if max_rows:
+                                # Fetch one extra row to detect truncation without
+                                # pulling the whole result set into memory.
+                                rows = cursor.fetchmany(max_rows + 1)
+                                truncated = len(rows) > max_rows
+                                rows = rows[:max_rows]
+                                if truncated:
+                                    # The rest of the result set has to be read
+                                    # off the connection even though it is being
+                                    # discarded: mysql-connector raises
+                                    # "Unread result found" when a cursor with
+                                    # pending rows is closed, which turned every
+                                    # capped query into a failure instead of a
+                                    # truncated answer. Drained in batches rather
+                                    # than with fetchall() so the rows this cap
+                                    # exists to avoid materialising are not all
+                                    # held at once.
+                                    while cursor.fetchmany(max_rows):
+                                        pass
+                            else:
+                                rows = cursor.fetchall()
+                                truncated = False
                             if not rows:
                                 return [TextContent(type="text", text="Query executed successfully. No results returned.")]
                             # Format rows as CSV-like text.
                             result = [",".join("" if v is None else str(v) for v in row) for row in rows]
-                            return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
+                            lines = [",".join(columns)] + result
+                            if truncated:
+                                # Say so explicitly: a silently truncated result
+                                # set reads as a complete answer and an agent will
+                                # draw conclusions from it.
+                                lines.append(
+                                    f"-- truncated at MYSQL_MAX_ROWS={max_rows}; "
+                                    "narrow the query or raise the limit"
+                                )
+                            return [TextContent(type="text", text="\n".join(lines))]
 
                         # Handling for Data Manipulation Language (DML) queries like INSERT, UPDATE, DELETE.
                         else:
@@ -543,6 +774,35 @@ async def run_query(query: str) -> list[TextContent]:
             except Error as e:
                 # Extract and log specific MySQL error messages.
                 error_msg = getattr(e, 'msg', None) or str(e) or 'Unknown MySQL error'
+                if is_connect_denial(e):
+                    # The server's own credentials were rejected. A fault, not a
+                    # refusal -- but MySQL's text names the account and the host
+                    # it dialled from, and the caller can act on neither.
+                    logger.error(
+                        "Could not authenticate to MySQL: %s. Check MYSQL_USER / "
+                        "MYSQL_PASSWORD%s.",
+                        error_msg,
+                        " and MYSQL_RO_USER / MYSQL_RO_PASSWORD" if read_only else "",
+                    )
+                    return [TextContent(type="text", text=CONNECT_DENIED_MESSAGE)]
+                if is_denial(e):
+                    # A policy refusal, not a fault: the caller is told it is not
+                    # permitted, but not *which* account was refused. MySQL's own
+                    # message names the user and host, which is not the caller's
+                    # business. Full detail still goes to the server log.
+                    #
+                    # Which message depends on the connection: on the read-only
+                    # one the caller's scope chose the account and can be changed;
+                    # on the read-write one the deployed account simply lacks a
+                    # privilege and mentioning scopes would misdirect.
+                    logger.warning(
+                        "Denied by MySQL (errno %s) on the %s connection: %s",
+                        getattr(e, "errno", "?"),
+                        "read-only" if read_only else "read-write",
+                        error_msg,
+                    )
+                    # Raised, not returned, so the result carries isError: true.
+                    raise StatementDenied(denial_message(read_only)) from e
                 logger.error(f"Error executing SQL: {error_msg}")
                 return [TextContent(type="text", text=f"Error executing query: {error_msg}")]
 
@@ -553,11 +813,75 @@ async def main():
     Main entry point for the MCP server.
     Supports both STDIO (default) and SSE (HTTP) transport modes.
     """
+    await _check_read_path()
+
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
     if transport == "sse":
         await _run_sse_server()
     else:
         await _run_stdio_server()
+
+
+async def _check_read_path():
+    """Report the read-path posture once, at startup, whatever the transport.
+
+    Two failures, two outcomes:
+
+    * **No read-only account.** A warning, and only under auth -- without auth
+      there is no scope and nothing is being claimed, so the original server's
+      behaviour is untouched. Under auth a read-scoped token still works, on the
+      read-write account, so failing closed here would break every deployment
+      that upgrades without provisioning the account first.
+    * **A read-only account that can write.** Fatal, on every transport:
+      ``MYSQL_RO_USER`` is honoured by ``get_db_config(read_only=True)``
+      unconditionally, stdio included, so every read-scoped call claims a
+      guarantee the database is not enforcing. Not a degraded configuration but
+      a false one, and unlike the case above there is nothing to preserve -- the
+      account exists, it just does not do what its name says.
+    """
+    if not has_readonly_credentials():
+        if auth_enabled_in_env():
+            logger.warning(
+                "MYSQL_RO_USER is not configured, so there is no read-only "
+                "database account and the read scope has nothing enforcing it. "
+                "A token holding only the read scope will run its SQL on the "
+                "read-write account: if you grant read scope expecting that a "
+                "DROP DATABASE cannot happen, that is not currently guaranteed. "
+                "Calls in that state are logged and audited as "
+                "'read_scope_not_enforced'. To close it: CREATE USER "
+                "'mcp_ro'@'%' IDENTIFIED BY '<password>'; GRANT SELECT ON "
+                "<database>.* TO 'mcp_ro'@'%'; then set MYSQL_RO_USER and "
+                "MYSQL_RO_PASSWORD."
+            )
+        return
+
+    problems = await anyio.to_thread.run_sync(verify_readonly_account)
+    if problems:
+        for problem in problems:
+            logger.error("Read-only account check failed: %s", problem)
+        if any(p.startswith(UNVERIFIABLE_PREFIX) for p in problems):
+            # Still fatal -- an unverified account is a guarantee this server
+            # would be claiming without having checked -- but say what actually
+            # happened. Told "MYSQL_RO_USER does not have a read-only privilege
+            # set", an operator goes and inspects grants that are fine.
+            raise RuntimeError(
+                "Could not verify the read-only account's grants, so whether the "
+                "read scope is enforced is unknown. The database was unreachable "
+                "or refused the connection -- check MYSQL_HOST, MYSQL_PORT and "
+                "the MYSQL_RO_USER credentials. See the error logged above."
+            )
+        raise RuntimeError(
+            "MYSQL_RO_USER does not have a read-only privilege set, so the read "
+            "scope would be enforced by an account that can write -- which is "
+            "worse than having no read-only account at all, because the "
+            "configuration says otherwise. Fix the grants (GRANT SELECT only), "
+            "or unset MYSQL_RO_USER to run without the split and get the "
+            "startup warning instead."
+        )
+    logger.info(
+        "Read path uses the read-only MySQL account (MYSQL_RO_USER); "
+        "writes are refused by the database itself."
+    )
 
 async def _run_stdio_server():
     """Runs the server using standard input/output streams."""
@@ -637,19 +961,118 @@ async def _run_sse_server():
         """Simple health check endpoint."""
         return Response("MySQL MCP Server is running", media_type="text/plain")
 
+    # Optional OAuth 2.1 authentication. Off unless MCP_AUTH_MODE is set, in
+    # which case the routes below gain a middleware and one public discovery
+    # route; with it unset nothing here changes.
+    from .auth import AuthSettings
+
+    auth_settings = AuthSettings.from_env()
+    routes = [
+        Route("/", endpoint=health_check),
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+    ]
+    middleware = []
+    verifier = None
+
+    if auth_settings.enabled:
+        from starlette.middleware import Middleware
+        from starlette.responses import JSONResponse
+
+        from .auth import AuthMiddleware, build_verifier
+        from .auth.middleware import prm_path_for
+
+        policy.configure(
+            auth_settings.read_scope,
+            auth_settings.write_scope,
+            audit_enabled=auth_settings.audit,
+        )
+
+        verifier = await build_verifier(auth_settings)
+
+        failure_throttle = None
+        if auth_settings.throttle_failures:
+            from .auth.throttle import FailureThrottle
+
+            failure_throttle = FailureThrottle(
+                max_failures=auth_settings.throttle_failures,
+                window_seconds=auth_settings.throttle_window_seconds,
+            )
+            logger.info(
+                "Throttling clients after %d authentication failures per %.0fs. "
+                "Keyed on the socket peer address, so this is only meaningful when "
+                "clients connect directly -- behind a proxy every caller shares one bucket.",
+                auth_settings.throttle_failures,
+                auth_settings.throttle_window_seconds,
+            )
+
+        async def protected_resource_metadata(request):
+            """RFC 9728 discovery document. Public by necessity: a client
+            cannot obtain a token without first reading where to get one."""
+            return JSONResponse(verifier.protected_resource_metadata())
+
+        # Serve the document at the path the 401 challenge actually names.
+        # RFC 9728 §3 puts a resource's own path *after* the well-known segment,
+        # so a non-root MCP_OAUTH_RESOURCE moves this route; hard-coding the root
+        # form made discovery 404 for exactly those deployments.
+        prm_route_path = prm_path_for(verifier.metadata_url())
+        routes.append(Route(prm_route_path, endpoint=protected_resource_metadata))
+        logger.info(
+            "Serving RFC 9728 protected-resource metadata at %s (advertised as %s)",
+            prm_route_path,
+            verifier.metadata_url(),
+        )
+        middleware.append(
+            Middleware(
+                AuthMiddleware,
+                verifier=verifier,
+                realm=auth_settings.realm,
+                tool_scopes=policy.tool_scope_map(
+                    auth_settings.read_scope, auth_settings.write_scope
+                ),
+                enforce_scopes=auth_settings.enforce_scopes,
+                bind_session_to_subject=auth_settings.bind_session_to_subject,
+                audit=auth_settings.audit,
+                throttle=failure_throttle,
+                resource_url=auth_settings.resource,
+                dpop=auth_settings.dpop,
+                dpop_algorithms=auth_settings.effective_dpop_algorithms,
+            )
+        )
+
+        if auth_settings.audit:
+            if auth_settings.audit_file:
+                from .auth import audit as audit_log
+
+                try:
+                    audit_log.to_file(auth_settings.audit_file)
+                except OSError as exc:
+                    # Not fatal: an unwritable audit path should be loud, not a
+                    # reason to refuse to serve. The records still reach stderr.
+                    logger.error(
+                        "Could not open MCP_AUTH_AUDIT_FILE=%s (%s); audit records "
+                        "go to stderr only.",
+                        auth_settings.audit_file, exc,
+                    )
+                else:
+                    logger.info("Audit records also written to %s", auth_settings.audit_file)
+            logger.info(
+                "Audit records enabled on logger 'mysql_mcp_server.audit' (one JSON "
+                "object per line). Each authorized tool call records sub, client_id, "
+                "jti, tool and statement -- identity a reverse proxy cannot provide."
+            )
+
     # Define the Starlette application with SSE routes and a health check.
-    starlette_app = Starlette(
-        routes=[
-            Route("/", endpoint=health_check),
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ]
-    )
+    starlette_app = Starlette(routes=routes, middleware=middleware)
 
     # Configure and start the Uvicorn server.
     server_config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
     server = uvicorn.Server(server_config)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        if verifier is not None:
+            await verifier.aclose()
 
 if __name__ == "__main__":
     # Start the asyncio event loop.

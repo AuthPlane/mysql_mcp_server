@@ -165,7 +165,7 @@ async def test_get_schema_info_cross_database(monkeypatch):
 
     captured = {}
 
-    async def fake_run_query(query):
+    async def fake_run_query(query, read_only=False):
         captured["query"] = query
         return []
 
@@ -184,7 +184,7 @@ async def test_get_table_sample_cross_database(monkeypatch):
 
     captured = {}
 
-    async def fake_run_query(query):
+    async def fake_run_query(query, read_only=False):
         captured["query"] = query
         return []
 
