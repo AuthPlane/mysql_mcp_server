@@ -46,6 +46,7 @@ async def test_call_tool_empty_results(mock_get_config, mock_connect):
     mock_cursor = MagicMock()
     mock_cursor.description = [("id",)]
     mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.return_value = []  # MYSQL_MAX_ROWS caps via fetchmany
     
     mock_conn = MagicMock()
     mock_conn.__enter__.return_value = mock_conn
